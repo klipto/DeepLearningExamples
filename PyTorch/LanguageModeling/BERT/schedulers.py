@@ -15,7 +15,7 @@
 import math
 import torch
 from torch.optim.optimizer import Optimizer
-from apex.optimizers import FP16_Optimizer
+#from apex.optimizers import FP16_Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 
 
@@ -24,6 +24,7 @@ class LRScheduler(_LRScheduler):
         # Check if using mixed precision training
         self.mixed_training = False
         base_optimizer = optimizer
+        print("type:" , type(optimizer))
         if isinstance(optimizer, FP16_Optimizer):
             self.mixed_training = True
             self.fp16_optimizer = optimizer
