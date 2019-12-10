@@ -708,11 +708,11 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         if closure is not None:
             loss = closure()
 
-        if self._is_first:
-            self._is_first = False
-            for group in self.param_groups:
-                for p in group['params']:
-                    self._starting_models[p].data.copy_(p.data)
+        #if self._is_first:
+        #    self._is_first = False
+        for group in self.optimizer.param_groups:
+            for p in group['params']:
+                self._starting_models[p].data.copy_(p.data)
         
         self.optimizer.step()
 
