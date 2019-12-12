@@ -30,9 +30,7 @@ import random
 import h5py
 from tqdm import tqdm, trange
 import os
-import horovod.torch as hvd
-hvd.init()
-os.environ['CUDA_VISIBLE_DEVICES'] = str(hvd.local_rank())
+import dist
 
 import numpy as np
 import torch
@@ -44,7 +42,7 @@ import multiprocessing
 
 from tokenization import BertTokenizer
 from modeling import BertForPreTraining, BertConfig
-from optimization import BertLAMB
+from optimization import BertLAMB, BertAdam
 from apex.optimizers import FusedAdam
 
 from file_utils import PYTORCH_PRETRAINED_BERT_CACHE
@@ -241,8 +239,10 @@ def setup_training(args):
         device = torch.device("cuda", args.local_rank)
         args.n_gpu = 1
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
-        torch.distributed.init_process_group(backend='nccl', init_method='env://')
+        #torch.distributed.init_process_group(backend='nccl', init_method='env://')
 
+    dist.local_init()
+    
     logger.info("device %s n_gpu %d distributed training %r", device, args.n_gpu, bool(args.local_rank != -1))
 
     if args.gradient_accumulation_steps < 1:
@@ -318,7 +318,12 @@ def prepare_model_and_optimizer(args, device):
                           betas=(0.9, 0.999),
                           bias_correction=True,
                           eps=1e-6)
-    
+
+    #optimizer = BertAdam(optimizer_grouped_parameters,
+    #                     lr=args.learning_rate,
+    #                     warmup=args.warmup_proportion,
+    #                      t_total=args.max_steps)
+                         
     if args.fp16:
 
         if args.loss_scale == 0:
@@ -359,12 +364,18 @@ def prepare_model_and_optimizer(args, device):
     elif args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
     else:
+        import horovod.torch as hvd
         from optimization import DistributedOptimizer, DistributedAdasumOptimizer
-        compression = hvd.Compression.none #if args.fp16_allreduce else hvd.Compression.none
+        compression = hvd.Compression.fp16 #if args.fp16_allreduce else hvd.Compression.none
         optimizer = DistributedAdasumOptimizer(optimizer,
                                          backward_passes_per_step=args.gradient_accumulation_steps,
                                          compression=compression)
-        hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+        if dist.local_rank() == 0:
+            hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+        for param in model.parameters():
+            handle = dist.local_broadcast_async_(param.data, root = 0)
+            handle.wait()
+            
         #hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
     return model, optimizer, checkpoint, global_step
@@ -386,10 +397,10 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
         amp_C.multi_tensor_scale(65536,
             overflow_buf,
             [master_grads, allreduced_views],
-            scaler.loss_scale() / (hvd.size() * args.gradient_accumulation_steps))
+            scaler.loss_scale() / (dist.world_size() * args.gradient_accumulation_steps))
         # 3. sum gradient across ranks. Because of the predivision, this averages the gradient
         #torch.distributed.all_reduce(flat_raw)
-        hvd.allreduce_(flat_raw, op=hvd.Sum)
+        dist.allreduce_(flat_raw, op=dist.Sum)
         # 4. combine unscaling and unflattening of allreduced gradient
         overflow_buf.zero_()
         amp_C.multi_tensor_scale(65536,
@@ -411,7 +422,7 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
             if is_main_process():
                 print(("Rank {} :: Gradient overflow.  Skipping step, "  +
                         "reducing loss scale to {}").format(
-                        hvd.rank(),
+                        dist.world_rank(),
                         scaler.loss_scale()))
             if _amp_state.opt_properties.master_weights:
                 for param in optimizer._amp_stash.all_fp32_from_fp16_params:
@@ -419,12 +430,12 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
         for param in model.parameters():
             param.grad = None
     else:
-        # toddm: only for adam
+        # toddm: only for fusedadam
         from optimization import warmup_linear as warmup
         tmp = warmup(global_step / args.max_steps, args.warmup_proportion)
         for group in optimizer.optimizer.param_groups:
             group['lr'] = args.learning_rate * tmp
-        torch.nn.utils.clip_grad_norm_([p for group in optimizer.optimizer.param_groups for p in group['params'] if p is not None], 1.0)
+
         # toddm end
         
         optimizer.step()
@@ -485,11 +496,11 @@ def main():
 
             shared_file_list = {}
 
-            if hvd.size() > num_files:
-                remainder = hvd.size() % num_files
-                data_file = files[(f_start_id*hvd.size()+hvd.rank() + remainder*f_start_id)%num_files]
+            if dist.world_size() > num_files:
+                remainder = dist.world_size() % num_files
+                data_file = files[(f_start_id*dist.world_size()+dist.world_rank() + remainder*f_start_id)%num_files]
             else:
-                data_file = files[(f_start_id*hvd.size()+hvd.rank())%num_files]
+                data_file = files[(f_start_id*dist.world_size()+dist.world_rank())%num_files]
 
             previous_file = data_file
 
@@ -507,10 +518,10 @@ def main():
             for f_id in range(f_start_id + 1 , len(files)):
                 
    
-                if hvd.size() > num_files:
-                    data_file = files[(f_id*hvd.size()+hvd.rank() + remainder*f_id)%num_files]
+                if dist.world_size() > num_files:
+                    data_file = files[(f_id*dist.world_size()+dist.world_rank() + remainder*f_id)%num_files]
                 else:
-                    data_file = files[(f_id*hvd.size()+hvd.rank())%num_files]
+                    data_file = files[(f_id*dist.world_size()+dist.world_rank())%num_files]
 
                 logger.info("file no %s file %s" % (f_id, previous_file))
 
@@ -551,8 +562,8 @@ def main():
                         last_num_steps = args.log_freq if last_num_steps == 0 else last_num_steps
                         average_loss = torch.tensor(average_loss, dtype=torch.float32).cuda()
                         average_loss = average_loss / (last_num_steps * divisor)
-                        average_loss /= hvd.size()
-                        hvd.allreduce_(average_loss)
+                        #average_loss /= dist.world_size()
+                        #hvd.allreduce_(average_loss)
                         if is_main_process():
                             logger.info("Total Steps:{} Final Loss = {}".format(training_steps / args.gradient_accumulation_steps, average_loss.item()))
                     elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:

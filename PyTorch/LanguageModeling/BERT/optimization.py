@@ -19,6 +19,8 @@
 import math
 import torch
 import horovod.torch as hvd
+import dist
+import torch.distributed
 from torch.optim import Optimizer
 from torch.optim.optimizer import required
 from torch.nn.utils import clip_grad_norm_
@@ -324,6 +326,54 @@ class BertAdam(Optimizer):
                 lr.append(lr_scheduled)
         return lr
 
+
+    def step_one(self, p, group):
+        grad = p.grad.data
+        if grad.is_sparse:
+            raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
+
+        state = self.state[p]
+
+        # State initialization
+        if len(state) == 0:
+            state['step'] = 0
+            # Exponential moving average of gradient values
+            state['next_m'] = torch.zeros_like(p.data)
+            # Exponential moving average of squared gradient values
+            state['next_v'] = torch.zeros_like(p.data)
+
+        next_m, next_v = state['next_m'], state['next_v']
+        beta1, beta2 = group['b1'], group['b2']
+
+        # Add grad clipping
+        if group['max_grad_norm'] > 0:
+            clip_grad_norm_(p, group['max_grad_norm'])
+
+        # Decay the first and second moment running average coefficient
+        # In-place operations to update the averages at the same time
+        next_m.mul_(beta1).add_(1 - beta1, grad)
+        next_v.mul_(beta2).addcmul_(1 - beta2, grad, grad)
+        update = next_m / (next_v.sqrt() + group['e'])
+
+        # Just adding the square of the weights to the loss function is *not*
+        # the correct way of using L2 regularization/weight decay with Adam,
+        # since that will interact with the m and v parameters in strange ways.
+        #
+        # Instead we want to decay the weights in a manner that doesn't interact
+        # with the m/v parameters. This is equivalent to adding the square
+        # of the weights to the loss with plain (non-momentum) SGD.
+        if group['weight_decay'] > 0.0:
+            update += group['weight_decay'] * p.data
+
+        if group['t_total'] != -1:
+            schedule_fct = SCHEDULES[group['schedule']]
+            lr_scheduled = group['lr'] * schedule_fct(state['step']/group['t_total'], group['warmup'])
+        else:
+            lr_scheduled = group['lr']
+
+        update_with_lr = lr_scheduled * update
+        return -update_with_lr
+    
     def step(self, closure=None):
         """Performs a single optimization step.
 
@@ -339,54 +389,13 @@ class BertAdam(Optimizer):
             for p in group['params']:
                 if p.grad is None:
                     continue
-                grad = p.grad.data
-                if grad.is_sparse:
-                    raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
-
+                #update_with_lr = self.step_one(p)
+                #p.data.add_(-update_with_lr)
                 state = self.state[p]
-
                 # State initialization
-                if len(state) == 0:
-                    state['step'] = 0
-                    # Exponential moving average of gradient values
-                    state['next_m'] = torch.zeros_like(p.data)
-                    # Exponential moving average of squared gradient values
-                    state['next_v'] = torch.zeros_like(p.data)
-
-                next_m, next_v = state['next_m'], state['next_v']
-                beta1, beta2 = group['b1'], group['b2']
-
-                # Add grad clipping
-                if group['max_grad_norm'] > 0:
-                    clip_grad_norm_(p, group['max_grad_norm'])
-
-                # Decay the first and second moment running average coefficient
-                # In-place operations to update the averages at the same time
-                next_m.mul_(beta1).add_(1 - beta1, grad)
-                next_v.mul_(beta2).addcmul_(1 - beta2, grad, grad)
-                update = next_m / (next_v.sqrt() + group['e'])
-
-                # Just adding the square of the weights to the loss function is *not*
-                # the correct way of using L2 regularization/weight decay with Adam,
-                # since that will interact with the m and v parameters in strange ways.
-                #
-                # Instead we want to decay the weights in a manner that doesn't interact
-                # with the m/v parameters. This is equivalent to adding the square
-                # of the weights to the loss with plain (non-momentum) SGD.
-                if group['weight_decay'] > 0.0:
-                    update += group['weight_decay'] * p.data
-
-                if group['t_total'] != -1:
-                    schedule_fct = SCHEDULES[group['schedule']]
-                    lr_scheduled = group['lr'] * schedule_fct(state['step']/group['t_total'], group['warmup'])
-                else:
-                    lr_scheduled = group['lr']
-
-                update_with_lr = lr_scheduled * update
-                p.data.add_(-update_with_lr)
-
+                #if len(state) == 0:
+                #    state['step'] = 0
                 state['step'] += 1
-
                 # step_size = lr_scheduled * math.sqrt(bias_correction2) / bias_correction1
                 # No bias correction
                 # bias_correction1 = 1 - beta1 ** state['step']
@@ -458,7 +467,7 @@ class DistributedOptimizer(torch.optim.Optimizer):
             self._allreduce_delay[p] = self.backward_passes_per_step
 
     def _register_hooks(self):
-        for param_group in self.param_groups:
+        for param_group in self.optimizer.param_groups:
             for p in param_group['params']:
                 if p.requires_grad:
                     p.grad = p.data.new(p.size()).zero_()
@@ -600,7 +609,8 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         self._requires_update = set()
         self._synchronized = False
         self._should_synchronize = True
-
+        self._is_first = True
+        
         self._starting_models = {
             p : torch.zeros_like(p, requires_grad=False)
             for _, p in named_parameters
@@ -611,9 +621,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
             for _, p in named_parameters
         }
 
-        self._is_first = True
-        
-        #self._register_hooks()
+        self._register_hooks()
 
     def set_backward_passes_per_step(self, passes):
         self.backward_passes_per_step = passes
@@ -621,7 +629,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
             self._allreduce_delay[p] = self.backward_passes_per_step
 
     def _register_hooks(self):
-        for param_group in self.param_groups:
+        for param_group in self.optimizer.param_groups:
             for p in param_group['params']:
                 if p.requires_grad:
                     p.grad = p.data.new(p.size()).zero_()
@@ -631,52 +639,74 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                     grad_acc.register_hook(self._make_hook(p))
                     self._grad_accs.append(grad_acc)
 
-    def _allreduce_grad_async(self, p):
-        # Delta optimizer implements this logic:
-        #  start = current.copy()
-        #  step() -> computes 'current - \alpha.f(g)' where f is
-        #            optimizer logic and g is the gradient
-        #  delta = current-start
-        #  allreduce_(delta)
-        #  start += delta
-        #  current = start
-        # In order to suppport this logic using function hook to improve performance,
-        # we do:
-        # delta = (start - \alpha.f(g)) - start
-        #       = -\alpha.f(g)
-        # set start to zero and step computes -\alpha.f(g)
-        # where f is the underlying optimizer logic
-
-        name = self._parameter_names.get(p)
-        start = self._starting_models[p]
-    
-        stashed_params = []
-        for group in self.param_groups:
-            stashed_params.append(group['params'])
-            # only want to step on p
-            if any([p is v for v in group['params']]):
-                group['params'] = [p]
-            else:
-                group['params'] = []
-
-        start.data.copy_(p)
-
-        self.optimizer.step()
-
-        # compute delta = curr - start
-        p.data.sub_(start)
+    def _allreduce_delta(self,p):        
+        handle = dist.local_reduce_mean_async_(p.grad.data)
         
-        # allreduce as before
-        scaler = self._scalers[p]
-        p.data.mul_(scaler.loss_scale)
-        tensor_compressed, ctx = self._compression.compress(p)
-        handle = hvd.allreduce_async_(tensor_compressed.data, name=name, op=hvd.Adasum)
+        if dist.local_rank() == 0:
+            group = None
+            found = False
+            for group in self.optimizer.param_groups:
+                if any([p is v for v in group['params']]):
+                    found = True
+                    break
+            assert group is not None
+            assert found
+            name = self._parameter_names.get(p)
+            handle.wait()
+            
+            delta = self.optimizer.step_one(p, group)
+            
+            tensor_compressed, ctx = self._compression.compress(delta)
+            handle = hvd.allreduce_async_(tensor_compressed.data, name=name, op=hvd.Adasum)
+            return handle, ctx
 
-        # reset stashed parameters
-        for stashed, group in zip(stashed_params, self.param_groups):
-            group['params'] = stashed        
+        handle.wait()
+        return handle, None
 
-        return handle, ctx
+    def _allreduce_delta2(self,p):        
+        handle = dist.local_reduce_mean_async_(p.grad.data)
+        
+        if dist.local_rank() == 0:
+            stashed_params = []
+            stashed_step = None
+            for group in self.optimizer.param_groups:
+                stashed_params.append(group['params'])
+                # only want to step on p
+                if any([p is v for v in group['params']]):
+                    group['params'] = [p]
+                    stashed_step = group.get('step', 0)
+                else:
+                    group['params'] = []
+
+            start = self._starting_models[p]
+            start.data.copy_(p)
+            name = self._parameter_names.get(p)
+            
+            handle.wait()
+            self.optimizer.step()
+            p.data.sub_(start)
+
+            # allreduce as before
+            tensor_compressed, ctx = self._compression.compress(p)
+            handle = hvd.allreduce_async_(tensor_compressed.data, name=name, op=hvd.Adasum)
+
+            # reset stashed parameters
+            for stashed, group in zip(stashed_params, self.optimizer.param_groups):
+                group['params'] = stashed
+
+            return handle, ctx
+
+        handle.wait()
+        return True, None #True -> Not None but we already waited
+    
+    def _allreduce_grad_async(self, p):
+        #return self._allreduce_delta(p)
+        #return self._allreduce_delta2(p)
+        name = self._parameter_names.get(p)
+        tensor = p.grad
+        tensor_compressed, ctx = self._compression.compress(tensor)
+        handle = dist.local_reduce_mean_async_(tensor_compressed.data)
+        return handle, (ctx, tensor_compressed)
 
     def _make_hook(self, p):
         def hook(*ignore):
@@ -697,7 +727,30 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         return hook
 
     def synchronize(self):
-        pass
+        missing_p = self._requires_update - set(self._handles.keys())
+        for p in missing_p:
+            handle, ctx = self._allreduce_grad_async(p)
+            self._handles[p] = (handle, ctx)
+
+        for p, value in self._handles.items():
+            handle, ctx = value
+            if handle is None:
+                handle, ctx = self._allreduce_grad_async(p)
+                self._handles[p] = (handle, ctx)
+
+        #local_handles = []
+        for p, (handle, ctx) in self._handles.items():
+            #if dist.local_rank() == 0:
+            #    output = hvd.synchronize(handle)
+            #    p.data.add_(self._compression.decompress(output, ctx).data)
+            #local_handles.append(dist.local_broadcast_async_(p.data))
+            handle.wait()
+            self._allreduce_delay[p] = self.backward_passes_per_step
+
+        self._handles.clear()
+
+        #for handle in local_handles:
+        #    handle.wait()
 
     @contextmanager
     def skip_synchronize(self):
@@ -707,41 +760,63 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         loss = None
         if closure is not None:
             loss = closure()
-
+        #self.synchronize()
+        #if dist.local_rank() == 0:
+        #    self.optimizer.step()
+        #return loss
+    
         #if self._is_first:
         #    self._is_first = False
-        for group in self.optimizer.param_groups:
-            for p in group['params']:
-                self._starting_models[p].data.copy_(p.data)
-        
-        self.optimizer.step()
+        local_broadcast_handles = []
+        if self._is_first and dist.local_rank() == 0:
+            self._is_first = False
+            for group in self.optimizer.param_groups:
+                for p in group['params']:                
+                    self._starting_models[p].data.copy_(p.data)
 
-        handles = []
-        for group in self.param_groups:
-            for p in group['params']:
-                name = self._parameter_names.get(p)
-                #scaler = self._scalers[p]
+        self.synchronize()
+
+        if dist.local_rank() == 0:        
+            torch.nn.utils.clip_grad_norm_([p for group in self.optimizer.param_groups for p in group['params'] if p.grad is not None], 1.0)
+            self.optimizer.step()
+
+            handles = []
+            for group in self.param_groups:
+                for p in group['params']:
+                    if p.grad is None:
+                        continue
+                    name = self._parameter_names.get(p)
+                    scaler = self._scalers[p]
+                    start = self._starting_models[p]
+                    p.data.sub_(start)
+                    p.data.mul_(scaler.loss_scale)
+                    tensor_compressed, ctx = self._compression.compress(p)
+                    handle = hvd.allreduce_async_(tensor_compressed.data, name=name, op=hvd.Adasum)
+                    handles.append((handle, p, ctx))
+
+            for handle, p, ctx in handles:
                 start = self._starting_models[p]
-                p.data.sub_(start)
-                #p.data.mul_(scaler.loss_scale)
-                #tensor_compressed, ctx = self._compression.compress(p)
-                tensor_compressed, ctx = p, None
-                handle = hvd.allreduce_async_(tensor_compressed.data, name=name, op=hvd.Adasum)
-                handles.append((handle, p, ctx))
-
-        for handle, p, ctx in handles:
-            start = self._starting_models[p]
-            #scaler = self._scalers[p]
-            delta = hvd.synchronize(handle)
-            #has_overflow = not (torch.isfinite(delta.data).all().item())
-            #if not has_overflow:                
-            #    delta = self._compression.decompress(delta, ctx)
-            #    delta.data.div_(scaler.loss_scale)
-            #    start.data.add_(delta.data)
-            start.data.add_(delta.data)
-            p.data.copy_(start)
-            #scaler.update_scale(has_overflow)
-
+                scaler = self._scalers[p]
+                delta = hvd.synchronize(handle)
+                has_overflow = not (torch.isfinite(delta.data).all().item())
+                if not has_overflow:                
+                    delta = self._compression.decompress(delta, ctx)
+                    delta.data.div_(scaler.loss_scale)
+                    start.data.add_(delta.data)
+                #start.data.add_(delta.data)
+                p.data.copy_(start)
+                local_broadcast_handles.append(dist.local_broadcast_async_(p.data))                
+                scaler.update_scale(has_overflow)
+        else:
+            for group in self.param_groups:
+                for p in group['params']:
+                    if p.grad is None:
+                        continue
+                    local_broadcast_handles.append(dist.local_broadcast_async_(p.data))
+            
+        for handle in local_broadcast_handles:
+            handle.wait()
+            
         return loss
 
     def zero_grad(self):

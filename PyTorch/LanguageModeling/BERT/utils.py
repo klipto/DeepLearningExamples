@@ -13,10 +13,11 @@
 
 import torch
 #import torch.distributed as dist
-import horovod.torch as hvd
+#import horovod.torch as hvd
+import dist
 
 def get_rank():
-    return hvd.rank()
+    return dist.world_rank()
 
 def is_main_process():
     return get_rank() == 0
