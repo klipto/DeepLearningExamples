@@ -774,8 +774,6 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 for p in group['params']:                
                     self._starting_models[p].data.copy_(p.data)
 
-        self.synchronize()
-
         if dist.local_rank() == 0:        
             torch.nn.utils.clip_grad_norm_([p for group in self.optimizer.param_groups for p in group['params'] if p.grad is not None], 1.0)
             self.optimizer.step()

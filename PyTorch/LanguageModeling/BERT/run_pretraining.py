@@ -550,6 +550,7 @@ def main():
                     if args.fp16:
                         with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
                             scaled_loss.backward()
+                            optimizer.synchronize()
                     else:
                         loss.backward()
                     average_loss += loss.item()
