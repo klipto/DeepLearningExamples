@@ -371,10 +371,18 @@ def prepare_model_and_optimizer(args, device):
                                          compression=compression)
         if dist.local_rank() == 0:
             hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+        # for param in model.parameters():
+        #     handle = dist.local_broadcast_async_(param.data, root = 0)
+        #     handle.wait()
+        handles = []
         for param in model.parameters():
             handle = dist.local_broadcast_async_(param.data, root = 0)
+            handles.append(handle)
+
+        # Wait for completion.
+        for handle in handles:
             handle.wait()
-            
+
         #hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
     return model, optimizer, checkpoint, global_step
@@ -437,7 +445,7 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
         # toddm end
         
         optimizer.step()
-        #optimizer.zero_grad()
+        optimizer.zero_grad()
         for param in model.parameters():
             param.grad = None
         global_step += 1

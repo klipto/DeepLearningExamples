@@ -783,7 +783,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 #self._starting_models[p].data.copy_(p.data)
                 self._starting_models[p] = torch.zeros_like(p, requires_grad=False)
                 self._starting_models[p].data.copy_(p.data)
-                self._scalers[p] = DynamicLossScaler()
+                self._scalers[p] = DynamicLossScaler(init_scale=2**15)
 
         total_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(self.optimizer), 1.0)
         self.optimizer.step()
@@ -829,6 +829,12 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
 
         for handle in local_broadcast_handles:
             handle.wait()
+        # if we did fp16 training, apex adds the following method
+        # to the optimizer.  It does not exist in fp32 training
+        if hasattr(self.optimizer,"_master_params_to_model_params"):
+            # tell apex to push master parameters to those parameters it uses for fp16
+            # training            
+            self.optimizer._master_params_to_model_params()
 
         return loss
 
