@@ -446,6 +446,10 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
         
         optimizer.step()
         optimizer.zero_grad()
+        if _amp_state.opt_properties.master_weights:
+            for param in optimizer.optimizer._amp_stash.all_fp32_from_fp16_params:
+                param.grad = None
+
         for param in model.parameters():
             param.grad = None
         global_step += 1
