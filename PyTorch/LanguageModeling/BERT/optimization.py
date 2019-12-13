@@ -29,6 +29,8 @@ from apex.optimizers import FusedAdam
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 
+from apex import amp
+
 multi_tensor_l2norm = amp_C.multi_tensor_l2norm
 lamb_compute_update = amp_C.multi_tensor_lamb_stage1_cuda
 lamb_apply_update = amp_C.multi_tensor_lamb_stage2_cuda
@@ -610,16 +612,16 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         self._synchronized = False
         self._should_synchronize = True
         self._is_first = True
-        
-        self._starting_models = {
-            p : torch.zeros_like(p, requires_grad=False)
-            for _, p in named_parameters
-        }
 
-        self._scalers = {
-            p : DynamicLossScaler()
-            for _, p in named_parameters
-        }
+        self._starting_models = {}
+        #p : torch.zeros_like(p, requires_grad=False)
+        #    for _, p in named_parameters
+        #}
+
+        self._scalers = {}
+        #p : DynamicLossScaler()
+        #    for _, p in named_parameters
+        #}
 
         self._register_hooks()
 
@@ -631,6 +633,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
     def _register_hooks(self):
         for param_group in self.optimizer.param_groups:
             for p in param_group['params']:
+                #for p in amp.master_params(self.optimizer):
                 if p.requires_grad:
                     p.grad = p.data.new(p.size()).zero_()
                     self._requires_update.add(p)
@@ -767,37 +770,41 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
     
         #if self._is_first:
         #    self._is_first = False
+
+        
         local_broadcast_handles = []
         if self._is_first and dist.local_rank() == 0:
             self._is_first = False
-            for group in self.optimizer.param_groups:
-                for p in group['params']:                
-                    self._starting_models[p].data.copy_(p.data)
-
-        self.synchronize()
+            #for group in self.optimizer.param_groups:
+            #    for p in group['params']:
+            for p in amp.master_params(self.optimizer):
+                #if p.grad is None:
+                #    continue
+                #self._starting_models[p].data.copy_(p.data)
+                self._starting_models[p] = torch.zeros_like(p, requires_grad=False)
+                self._starting_models[p].data.copy_(p.data)
+                self._scalers[p] = DynamicLossScaler()
 
         if dist.local_rank() == 0:
-            from apex import amp
-            print("A", flush=True)
-            total_norm = torch.nn.utils.clip_grad_norm_([p for p in amp.master_params(self)], 1.0)
-            print("B",total_norm, flush=True)
+            total_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(self.optimizer), 1.0)
             self.optimizer.step()
-            print("C", flush=True)
-
+            
             handles = []
-            for group in self.param_groups:
-                for p in group['params']:
-                    if p.grad is None:
-                        continue
-                    name = self._parameter_names.get(p)
-                    scaler = self._scalers[p]
-                    start = self._starting_models[p]
-                    p.data.sub_(start)
-                    p.data.mul_(scaler.loss_scale)
-                    tensor_compressed, ctx = self._compression.compress(p)
-                    handle = hvd.allreduce_async_(tensor_compressed.data, name=name, op=hvd.Adasum)
-                    handles.append((handle, p, ctx))
-            print("D", flush=True)
+            #for group in self.optimizer.param_groups:
+            #    for p in group['params']:
+            for p in amp.master_params(self.optimizer):
+                ##if p.grad is None:
+                #    continue
+                name = self._parameter_names.get(p)
+                scaler = self._scalers[p]
+                start = self._starting_models[p]
+                p.data.sub_(start)
+                p.data.mul_(scaler.loss_scale)
+                #tensor_compressed, ctx = p, None
+                tensor_compressed, ctx = self._compression.compress(p)
+                handle = hvd.allreduce_async_(tensor_compressed.data, name=name, op=hvd.Adasum)
+                handles.append((handle, p, ctx))
+
             for handle, p, ctx in handles:
                 start = self._starting_models[p]
                 scaler = self._scalers[p]
@@ -811,17 +818,18 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 p.data.copy_(start)
                 local_broadcast_handles.append(dist.local_broadcast_async_(p.data))                
                 scaler.update_scale(has_overflow)
-            print("E", flush=True)
+
         else:
-            for group in self.param_groups:
-                for p in group['params']:
-                    if p.grad is None:
-                        continue
-                    local_broadcast_handles.append(dist.local_broadcast_async_(p.data))
-            
+            #for group in self.param_groups:
+            #    for p in group['params']:
+            for p in amp.master_params(self.optimizer):
+                #if p.grad is None:
+                #        continue
+                local_broadcast_handles.append(dist.local_broadcast_async_(p.data))
+
         for handle in local_broadcast_handles:
             handle.wait()
-            
+
         return loss
 
     def zero_grad(self):
