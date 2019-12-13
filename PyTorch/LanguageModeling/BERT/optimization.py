@@ -816,7 +816,8 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                     start.data.add_(delta.data)
                 #start.data.add_(delta.data)
                 p.data.copy_(start)
-                local_broadcast_handles.append(dist.local_broadcast_async_(p.data))                
+                #local_broadcast_handles.append(dist.local_broadcast_async_(p.data))
+                dist.local_broadcast_sync_(p.data)
                 scaler.update_scale(has_overflow)
 
         else:
@@ -825,10 +826,11 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
             for p in amp.master_params(self.optimizer):
                 #if p.grad is None:
                 #        continue
-                local_broadcast_handles.append(dist.local_broadcast_async_(p.data))
+                #local_broadcast_handles.append(dist.local_broadcast_async_(p.data))
+                dist.local_broadcast_sync_(p.data)
 
-        for handle in local_broadcast_handles:
-            handle.wait()
+        # for handle in local_broadcast_handles:
+        #     handle.wait()
         # if we did fp16 training, apex adds the following method
         # to the optimizer.  It does not exist in fp32 training
         if hasattr(self.optimizer,"_master_params_to_model_params"):

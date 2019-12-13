@@ -20,6 +20,10 @@ def local_broadcast_async_(tensor, root=0):
     handle = torch.distributed.broadcast(tensor, src=root, async_op=True)
     return handle
 
+def local_broadcast_sync_(tensor, root=0):
+    import torch
+    torch.distributed.broadcast(tensor, src=root, async_op=False)
+
 def local_rank():
     return world_rank() % num_devices
 

@@ -335,25 +335,6 @@ def prepare_model_and_optimizer(args, device):
                     master_weights=False if args.accumulate_into_fp16 else True)
         amp._amp_state.loss_scalers[0]._loss_scale = 2**20
 
-    if args.resume_from_checkpoint:
-        if args.phase2:
-            keys = list(checkpoint['optimizer']['state'].keys())
-            #Override hyperparameters from Phase 1
-            for key in keys:
-                checkpoint['optimizer']['state'][key]['step'] = global_step
-            for iter, item in enumerate(checkpoint['optimizer']['param_groups']):
-                checkpoint['optimizer']['param_groups'][iter]['t_total'] = args.max_steps
-                checkpoint['optimizer']['param_groups'][iter]['warmup'] = args.warmup_proportion
-                checkpoint['optimizer']['param_groups'][iter]['lr'] = args.learning_rate
-        optimizer.load_state_dict(checkpoint['optimizer'])  # , strict=False)
-
-        # Restore AMP master parameters          
-        if args.fp16:
-            optimizer._lazy_init_maybe_master_weights()
-            optimizer._amp_stash.lazy_init_called = True
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            for param, saved_param in zip(amp.master_params(optimizer), checkpoint['master params']):
-                param.data.copy_(saved_param.data)
 
     if args.local_rank != -1:
         if not args.allreduce_post_accumulation:
@@ -369,18 +350,30 @@ def prepare_model_and_optimizer(args, device):
         optimizer = DistributedAdasumOptimizer(optimizer,
                                          backward_passes_per_step=args.gradient_accumulation_steps,
                                          compression=compression)
+        if args.resume_from_checkpoint:
+            # Restore AMP master parameters          
+            if args.fp16:
+                optimizer.optimizer._lazy_init_maybe_master_weights()
+                optimizer.optimizer._amp_stash.lazy_init_called = True
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                for param, saved_param in zip(amp.master_params(optimizer), checkpoint['master params']):
+                    param.data.copy_(saved_param.data)
+            else:
+                if args.phase2:
+                    keys = list(checkpoint['optimizer']['state'].keys())
+                    #Override hyperparameters from Phase 1
+                    for key in keys:
+                        checkpoint['optimizer']['state'][key]['step'] = global_step
+                    for iter, item in enumerate(checkpoint['optimizer']['param_groups']):
+                        checkpoint['optimizer']['param_groups'][iter]['t_total'] = args.max_steps
+                        checkpoint['optimizer']['param_groups'][iter]['warmup'] = args.warmup_proportion
+                        checkpoint['optimizer']['param_groups'][iter]['lr'] = args.learning_rate
+                optimizer.load_state_dict(checkpoint['optimizer'])  # , strict=False)
+
         if dist.local_rank() == 0:
             hvd.broadcast_parameters(model.state_dict(), root_rank=0)
-        # for param in model.parameters():
-        #     handle = dist.local_broadcast_async_(param.data, root = 0)
-        #     handle.wait()
-        handles = []
         for param in model.parameters():
             handle = dist.local_broadcast_async_(param.data, root = 0)
-            handles.append(handle)
-
-        # Wait for completion.
-        for handle in handles:
             handle.wait()
 
         #hvd.broadcast_optimizer_state(optimizer, root_rank=0)
@@ -511,7 +504,9 @@ def main():
                 data_file = files[(f_start_id*dist.world_size()+dist.world_rank() + remainder*f_start_id)%num_files]
             else:
                 data_file = files[(f_start_id*dist.world_size()+dist.world_rank())%num_files]
-
+            
+            file_name = data_file[data_file.rfind('/'):]
+            data_file=args.input_dir + file_name
             previous_file = data_file
 
             train_data = pretraining_dataset(data_file, args.max_predictions_per_seq)
