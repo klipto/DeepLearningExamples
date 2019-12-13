@@ -785,10 +785,10 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 self._starting_models[p].data.copy_(p.data)
                 self._scalers[p] = DynamicLossScaler()
 
+        total_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(self.optimizer), 1.0)
+        self.optimizer.step()
+                
         if dist.local_rank() == 0:
-            total_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(self.optimizer), 1.0)
-            self.optimizer.step()
-            
             handles = []
             #for group in self.optimizer.param_groups:
             #    for p in group['params']:

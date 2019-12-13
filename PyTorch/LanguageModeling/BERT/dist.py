@@ -12,7 +12,7 @@ def local_init():
 def local_reduce_mean_async_(tensor, root=0):
     import torch
     tensor.div_(local_size())
-    handle = torch.distributed.reduce(tensor, dst=root, async_op=True)
+    handle = torch.distributed.all_reduce(tensor, async_op=True)
     return handle
 
 def local_broadcast_async_(tensor, root=0):
