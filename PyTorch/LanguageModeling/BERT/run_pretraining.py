@@ -323,9 +323,14 @@ def prepare_model_and_optimizer(args, device):
     #                     lr=args.learning_rate,
     #                     warmup=args.warmup_proportion,
     #                      t_total=args.max_steps)
-                         
-    if args.fp16:
 
+    import horovod.torch as hvd
+    from optimization import DistributedOptimizer, DistributedAdasumOptimizer
+    compression = hvd.Compression.fp16 #if args.fp16_allreduce else hvd.Compression.none
+    optimizer = DistributedAdasumOptimizer(optimizer,
+                                     backward_passes_per_step=args.gradient_accumulation_steps,
+                                     compression=compression)    
+    if args.fp16:
         if args.loss_scale == 0:
             # optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
             model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale="dynamic", 
@@ -364,17 +369,25 @@ def prepare_model_and_optimizer(args, device):
     elif args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
     else:
-        import horovod.torch as hvd
-        from optimization import DistributedOptimizer, DistributedAdasumOptimizer
-        compression = hvd.Compression.fp16 #if args.fp16_allreduce else hvd.Compression.none
-        optimizer = DistributedAdasumOptimizer(optimizer,
-                                         backward_passes_per_step=args.gradient_accumulation_steps,
-                                         compression=compression)
         if dist.local_rank() == 0:
             hvd.broadcast_parameters(model.state_dict(), root_rank=0)
         for param in model.parameters():
             handle = dist.local_broadcast_async_(param.data, root = 0)
             handle.wait()
+        #todo: optimizer?
+        
+    # else:
+    #     import horovod.torch as hvd
+    #     from optimization import DistributedOptimizer, DistributedAdasumOptimizer
+    #     compression = hvd.Compression.fp16 #if args.fp16_allreduce else hvd.Compression.none
+    #     optimizer = DistributedAdasumOptimizer(optimizer,
+    #                                      backward_passes_per_step=args.gradient_accumulation_steps,
+    #                                      compression=compression)
+    #     if dist.local_rank() == 0:
+    #         hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+    #     for param in model.parameters():
+    #         handle = dist.local_broadcast_async_(param.data, root = 0)
+    #         handle.wait()
             
         #hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
@@ -435,7 +448,6 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
         tmp = warmup(global_step / args.max_steps, args.warmup_proportion)
         for group in optimizer.optimizer.param_groups:
             group['lr'] = args.learning_rate * tmp
-
         # toddm end
         
         optimizer.step()
@@ -548,7 +560,8 @@ def main():
                             loss = loss / args.gradient_accumulation_steps
                             divisor = 1.0
                     if args.fp16:
-                        with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
+                        #with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
+                        with amp.scale_loss(loss, optimizer) as scaled_loss:
                             scaled_loss.backward()
                     else:
                         loss.backward()

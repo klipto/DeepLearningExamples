@@ -776,9 +776,13 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
 
         self.synchronize()
 
-        if dist.local_rank() == 0:        
-            torch.nn.utils.clip_grad_norm_([p for group in self.optimizer.param_groups for p in group['params'] if p.grad is not None], 1.0)
+        if dist.local_rank() == 0:
+            from apex import amp
+            print("A", flush=True)
+            total_norm = torch.nn.utils.clip_grad_norm_([p for p in amp.master_params(self)], 1.0)
+            print("B",total_norm, flush=True)
             self.optimizer.step()
+            print("C", flush=True)
 
             handles = []
             for group in self.param_groups:
@@ -793,7 +797,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                     tensor_compressed, ctx = self._compression.compress(p)
                     handle = hvd.allreduce_async_(tensor_compressed.data, name=name, op=hvd.Adasum)
                     handles.append((handle, p, ctx))
-
+            print("D", flush=True)
             for handle, p, ctx in handles:
                 start = self._starting_models[p]
                 scaler = self._scalers[p]
@@ -807,6 +811,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 p.data.copy_(start)
                 local_broadcast_handles.append(dist.local_broadcast_async_(p.data))                
                 scaler.update_scale(has_overflow)
+            print("E", flush=True)
         else:
             for group in self.param_groups:
                 for p in group['params']:
