@@ -708,7 +708,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         name = self._parameter_names.get(p)
         tensor = p.grad
         tensor_compressed, ctx = self._compression.compress(tensor)
-        handle = dist.local_reduce_mean_async_(tensor_compressed.data)
+        handle = dist.local_allreduce_mean_async_(tensor_compressed.data)
         return handle, (ctx, tensor_compressed)
 
     def _make_hook(self, p):
@@ -773,39 +773,31 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
 
         
         local_broadcast_handles = []
-        if self._is_first and dist.local_rank() == 0:
+        if self._is_first:
             self._is_first = False
-            #for group in self.optimizer.param_groups:
-            #    for p in group['params']:
             for p in amp.master_params(self.optimizer):
-                #if p.grad is None:
-                #    continue
-                #self._starting_models[p].data.copy_(p.data)
                 self._starting_models[p] = torch.zeros_like(p, requires_grad=False)
                 self._starting_models[p].data.copy_(p.data)
                 self._scalers[p] = DynamicLossScaler(init_scale=2**15)
 
         total_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(self.optimizer), 1.0)
         self.optimizer.step()
-                
-        if dist.local_rank() == 0:
-            handles = []
-            #for group in self.optimizer.param_groups:
-            #    for p in group['params']:
-            for p in amp.master_params(self.optimizer):
-                ##if p.grad is None:
-                #    continue
+
+        handles = []
+        for index, p in enumerate(amp.master_params(self.optimizer)):
+            handle, ctx = None, None
+            if index % dist.num_devices == dist.local_rank():
                 name = self._parameter_names.get(p)
                 scaler = self._scalers[p]
                 start = self._starting_models[p]
                 p.data.sub_(start)
                 p.data.mul_(scaler.loss_scale)
-                #tensor_compressed, ctx = p, None
                 tensor_compressed, ctx = self._compression.compress(p)
                 handle = hvd.allreduce_async_(tensor_compressed.data, name=name, op=hvd.Adasum)
-                handles.append((handle, p, ctx))
+            handles.append((handle, p, ctx))
 
-            for handle, p, ctx in handles:
+        for index, (handle, p, ctx) in enumerate(handles):
+            if index % dist.num_devices == dist.local_rank():
                 start = self._starting_models[p]
                 scaler = self._scalers[p]
                 delta = hvd.synchronize(handle)
@@ -814,20 +806,11 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                     delta = self._compression.decompress(delta, ctx)
                     delta.data.div_(scaler.loss_scale)
                     start.data.add_(delta.data)
-                #start.data.add_(delta.data)
                 p.data.copy_(start)
-                #local_broadcast_handles.append(dist.local_broadcast_async_(p.data))
-                dist.local_broadcast_sync_(p.data)
+                dist.local_broadcast_sync_(p.data, root=index % dist.num_devices)
                 scaler.update_scale(has_overflow)
-
-        else:
-            #for group in self.param_groups:
-            #    for p in group['params']:
-            for p in amp.master_params(self.optimizer):
-                #if p.grad is None:
-                #        continue
-                #local_broadcast_handles.append(dist.local_broadcast_async_(p.data))
-                dist.local_broadcast_sync_(p.data)
+            else:
+                dist.local_broadcast_sync_(p.data, root=index % dist.num_devices)
 
         # for handle in local_broadcast_handles:
         #     handle.wait()

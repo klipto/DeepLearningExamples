@@ -9,7 +9,7 @@ def local_init():
                                          world_size=num_devices,
                                          rank=local_rank())
 
-def local_reduce_mean_async_(tensor, root=0):
+def local_allreduce_mean_async_(tensor, root=0):
     import torch
     tensor.div_(local_size())
     handle = torch.distributed.all_reduce(tensor, async_op=True)
@@ -38,9 +38,9 @@ def world_size():
 
 
 num_devices = 4
-#newcomm = MPI.COMM_WORLD.Split(MPI.COMM_WORLD.rank % num_devices, MPI.COMM_WORLD.rank)
-#hvd.init(comm=newcomm)
-if world_rank() % num_devices == 0:
-    hvd.init(comm=[i for i in range(world_size()) if i % num_devices == 0])
+newcomm = MPI.COMM_WORLD.Split(MPI.COMM_WORLD.rank % num_devices, MPI.COMM_WORLD.rank)
+hvd.init(comm=newcomm)
+#if world_rank() % num_devices == 0:
+#    hvd.init(comm=[i for i in range(world_size()) if i % num_devices == 0])
 os.environ['CUDA_VISIBLE_DEVICES'] = str(local_rank())
 
