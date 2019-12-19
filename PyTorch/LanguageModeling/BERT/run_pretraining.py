@@ -355,8 +355,8 @@ def prepare_model_and_optimizer(args, device):
             if args.fp16:
                 optimizer.optimizer._lazy_init_maybe_master_weights()
                 optimizer.optimizer._amp_stash.lazy_init_called = True
-                optimizer.load_state_dict(checkpoint['optimizer'])
-                for param, saved_param in zip(amp.master_params(optimizer), checkpoint['master params']):
+                optimizer.optimizer.load_state_dict(checkpoint['optimizer'])
+                for param, saved_param in zip(amp.master_params(optimizer.optimizer), checkpoint['master params']):
                     param.data.copy_(saved_param.data)
             else:
                 if args.phase2:
@@ -368,7 +368,7 @@ def prepare_model_and_optimizer(args, device):
                         checkpoint['optimizer']['param_groups'][iter]['t_total'] = args.max_steps
                         checkpoint['optimizer']['param_groups'][iter]['warmup'] = args.warmup_proportion
                         checkpoint['optimizer']['param_groups'][iter]['lr'] = args.learning_rate
-                optimizer.load_state_dict(checkpoint['optimizer'])  # , strict=False)
+                optimizer.optimizer.load_state_dict(checkpoint['optimizer'])  # , strict=False)
 
         if dist.local_rank() == 0:
             hvd.broadcast_parameters(model.state_dict(), root_rank=0)
@@ -598,8 +598,8 @@ def main():
                                 output_save_file = os.path.join(args.output_dir, "ckpt_{}.pt".format(global_step + args.phase1_end_step))
                             if args.do_train:
                                 torch.save({'model': model_to_save.state_dict(),
-                                            'optimizer': optimizer.state_dict(),
-                                            'master params': list(amp.master_params(optimizer)),
+                                            'optimizer': optimizer.optimizer.state_dict(),
+                                            'master params': list(amp.master_params(optimizer.optimizer)),
                                             'files': [f_id] + files}, output_save_file)
 
                                 most_recent_ckpts_paths.append(output_save_file)
