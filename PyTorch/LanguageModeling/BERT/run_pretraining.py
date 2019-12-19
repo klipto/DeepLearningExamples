@@ -54,7 +54,7 @@ import amp_C
 import apex_C
 from apex.amp import _amp_state
 
-from concurrent.futures import ProcessPoolExecutor
+#from concurrent.futures import ProcessPoolExecutor
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
@@ -478,7 +478,7 @@ def main():
         epoch = 0
         training_steps = 0
 
-        pool = ProcessPoolExecutor(1)
+        #pool = ProcessPoolExecutor(1)
 
         # Note: We loop infinitely over epochs, termination is handled via iteration count
         while True:
@@ -528,11 +528,12 @@ def main():
                 else:
                     data_file = files[(f_id*dist.world_size()+dist.world_rank())%num_files]
 
-                logger.info("file no %s file %s" % (f_id, previous_file))
+                #logger.info("file no %s file %s" % (f_id, previous_file))
+                print("file no %s file %s" % (f_id, previous_file),flush=True)
 
                 previous_file = data_file
 
-                dataset_future = pool.submit(create_pretraining_dataset, data_file, args.max_predictions_per_seq, shared_file_list, args)
+                #dataset_future = pool.submit(create_pretraining_dataset, data_file, args.max_predictions_per_seq, shared_file_list, args)
 
                 train_iter = tqdm(train_dataloader, desc="Iteration") if is_main_process() else train_dataloader
                 for step, batch in enumerate(train_iter):
@@ -616,7 +617,8 @@ def main():
                 # thread.join()
                 # Make sure pool has finished and switch train_dataloader
                 # NOTE: Will block until complete
-                train_dataloader, data_file = dataset_future.result(timeout=None)
+                #train_dataloader, data_file = dataset_future.result(timeout=None)
+                train_dataloader, data_file = create_pretraining_dataset(data_file, args.max_predictions_per_seq, shared_file_list, args)
 
             epoch += 1
 
