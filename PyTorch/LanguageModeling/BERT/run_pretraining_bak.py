@@ -30,9 +30,7 @@ import random
 import h5py
 from tqdm import tqdm, trange
 import os
-import distributed_optimizers
-from distributed_optimizers import num_devices
-
+import dist
 import sys
 root = os.path.dirname(__file__)
 sys.path.insert(0, root)
@@ -44,7 +42,6 @@ from torch.utils.data.distributed import DistributedSampler
 import math
 from apex import amp
 import multiprocessing
-from mpi4py import MPI
 
 from tokenization import BertTokenizer
 from modeling import BertForPreTraining, BertConfig
@@ -59,22 +56,14 @@ from apex.parallel.distributed import flat_dist_call
 import amp_C
 import apex_C
 from apex.amp import _amp_state
-import horovod.torch as hvd
 
-from concurrent.futures import ProcessPoolExecutor
+#from concurrent.futures import ProcessPoolExecutor
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# This prevents us from using P2P if on P2P-enabled systems
-#os.environ['CUDA_VISIBLE_DEVICES'] = str(distributed_optimizers.local_rank())
-
-# Initialize Horovod with partial ranks
-print('Total number of devices on this node: ' + str(num_devices))
-newcomm = MPI.COMM_WORLD.Split(MPI.COMM_WORLD.rank % num_devices, MPI.COMM_WORLD.rank)
-hvd.init(comm=newcomm)
 
 def create_pretraining_dataset(input_file, max_pred_length, shared_list, args):
 
@@ -176,6 +165,10 @@ def parse_arguments():
                         type=float,
                         help="Proportion of training to perform linear learning rate warmup for. "
                              "E.g., 0.1 = 10%% of training.")
+    parser.add_argument("--local_rank",
+                        type=int,
+                        default=-1,
+                        help="local_rank for distributed training on gpus")
     parser.add_argument('--seed',
                         type=int,
                         default=42,
@@ -241,17 +234,20 @@ def setup_training(args):
 
     assert (torch.cuda.is_available())
 
-    #device = torch.device("cuda", distributed_optimizers.local_rank())
-    torch.cuda.set_device(distributed_optimizers.local_rank())
-    device = torch.device("cuda", distributed_optimizers.local_rank())
-    args.n_gpu = 1
-    # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
-    #torch.distributed.init_process_group(backend='nccl', init_method='env://')
+    if args.local_rank == -1:
+        device = torch.device("cuda")
+        args.n_gpu = torch.cuda.device_count()
+    else:
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device("cuda", args.local_rank)
+        args.n_gpu = 1
+        # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+        #torch.distributed.init_process_group(backend='nccl', init_method='env://')
 
-    distributed_optimizers.local_init()
+    dist.local_init()
     
-    logger.info("device %s n_gpu %d distributed training %r", device, args.n_gpu, bool(distributed_optimizers.local_rank() != -1))
-    print("device %s n_gpu %d distributed training %r", device, args.n_gpu, bool(distributed_optimizers.local_rank() != -1))
+    logger.info("device %s n_gpu %d distributed training %r", device, args.n_gpu, bool(args.local_rank != -1))
+    print("device %s n_gpu %d distributed training %r", device, args.n_gpu, bool(args.local_rank != -1))
 
     if args.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
@@ -327,6 +323,11 @@ def prepare_model_and_optimizer(args, device):
                           bias_correction=True,
                           eps=1e-6)
 
+    #optimizer = BertAdam(optimizer_grouped_parameters,
+    #                     lr=args.learning_rate,
+    #                     warmup=args.warmup_proportion,
+    #                      t_total=args.max_steps)
+
     if args.fp16:
         if args.loss_scale == 0:
             # optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
@@ -338,54 +339,52 @@ def prepare_model_and_optimizer(args, device):
                     master_weights=False if args.accumulate_into_fp16 else True)
         amp._amp_state.loss_scalers[0]._loss_scale = 2**20
 
-    from distributed_optimizers import DistributedOptimizer, DistributedAdasumOptimizer, DistributedCpuAdasumOptimizer
-    compression = hvd.Compression.fp16 #if args.fp16_allreduce else hvd.Compression.none
-    if args.phase2:
-        optimizer = DistributedCpuAdasumOptimizer(optimizer, compression=compression)
-        print("Created Adasum optimizer for CPU reduction.")
-    else:
-        optimizer = DistributedAdasumOptimizer(optimizer,
-                                        backward_passes_per_step=args.gradient_accumulation_steps,
-                                        compression=compression)
-        print("Created distributed Adasum optimizer.")
 
-    if args.resume_from_checkpoint:
-        # Restore AMP master parameters
-        if args.phase2:
-            keys = list(checkpoint['optimizer']['state'].keys())
-            # Override hyperparameters from Phase 1
-            # We don't need the step parameter for fuseAdam, this causes hvd to throw same key error.
-            # for key in keys:
-            #     checkpoint['optimizer']['state'][key]['step'] = global_step
-            for iter, item in enumerate(checkpoint['optimizer']['param_groups']):
-                checkpoint['optimizer']['param_groups'][iter]['t_total'] = args.max_steps
-                checkpoint['optimizer']['param_groups'][iter]['warmup'] = args.warmup_proportion
-                checkpoint['optimizer']['param_groups'][iter]['lr'] = args.learning_rate
-        
-        if args.fp16:
-            optimizer.optimizer._lazy_init_maybe_master_weights()
-            optimizer.optimizer._amp_stash.lazy_init_called = True
-            optimizer.optimizer.load_state_dict(checkpoint['optimizer'])
-            for param, saved_param in zip(amp.master_params(optimizer.optimizer), checkpoint['master params']):
-                param.data.copy_(saved_param.data)
+    if args.local_rank != -1:
+        if not args.allreduce_post_accumulation:
+            model = DDP(model, message_size=250000000, gradient_predivide_factor=torch.distributed.get_world_size())
         else:
-            optimizer.optimizer.load_state_dict(checkpoint['optimizer'])  # , strict=False)
+            flat_dist_call([param.data for param in model.parameters()], torch.distributed.broadcast, (0,) )
+    elif args.n_gpu > 1:
+        model = torch.nn.DataParallel(model)
+    else:
+        import horovod.torch as hvd
+        from optimization import DistributedOptimizer, DistributedAdasumOptimizer
+        compression = hvd.Compression.fp16 #if args.fp16_allreduce else hvd.Compression.none
+        optimizer = DistributedAdasumOptimizer(optimizer,
+                                         backward_passes_per_step=args.gradient_accumulation_steps,
+                                         compression=compression)
+        if args.resume_from_checkpoint:
+            # Restore AMP master parameters          
+            if args.fp16:
+                optimizer.optimizer._lazy_init_maybe_master_weights()
+                optimizer.optimizer._amp_stash.lazy_init_called = True
+                optimizer.optimizer.load_state_dict(checkpoint['optimizer'])
+                for param, saved_param in zip(amp.master_params(optimizer.optimizer), checkpoint['master params']):
+                    param.data.copy_(saved_param.data)
+            else:
+                if args.phase2:
+                    keys = list(checkpoint['optimizer']['state'].keys())
+                    #Override hyperparameters from Phase 1
+                    for key in keys:
+                        checkpoint['optimizer']['state'][key]['step'] = global_step
+                    for iter, item in enumerate(checkpoint['optimizer']['param_groups']):
+                        checkpoint['optimizer']['param_groups'][iter]['t_total'] = args.max_steps
+                        checkpoint['optimizer']['param_groups'][iter]['warmup'] = args.warmup_proportion
+                        checkpoint['optimizer']['param_groups'][iter]['lr'] = args.learning_rate
+                optimizer.optimizer.load_state_dict(checkpoint['optimizer'])  # , strict=False)
 
-    if distributed_optimizers.local_rank() == 0:
-        print("Broadcasting parameters.")
-        hvd.broadcast_parameters(model.state_dict(), root_rank=0)
-    for param in model.parameters():
-        handle = distributed_optimizers.local_broadcast_async_(param.data, root = 0)
-        handle.wait()
-    # If we are starting anew, manually initialize apex states so that bcast optimizer state can pass.
-    if not args.resume_from_checkpoint:
-        optimizer.optimizer._amp_lazy_init()
-    print("Broadcasting optimizer states.")
-    hvd.broadcast_optimizer_state(optimizer.optimizer, root_rank=0)
+        if dist.local_rank() == 0:
+            hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+        for param in model.parameters():
+            handle = dist.local_broadcast_async_(param.data, root = 0)
+            handle.wait()
+
+        #hvd.broadcast_optimizer_state(optimizer.optimizer, root_rank=0)
 
     return model, optimizer, checkpoint, global_step
 
-def take_optimizer_step(args, optimizer, model, overflow_buf, global_step, device):
+def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
 
     if args.allreduce_post_accumulation:
         # manually allreduce gradients after all accumulation steps
@@ -395,17 +394,17 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step, devic
         master_grads = [p.grad for p in amp.master_params(optimizer) if p.grad is not None]
         flat_grad_size = sum(p.numel() for p in master_grads)
         allreduce_dtype = torch.float16 if args.allreduce_post_accumulation_fp16 else torch.float32
-        flat_raw = torch.empty(flat_grad_size, device=device, dtype=allreduce_dtype)
+        flat_raw = torch.empty(flat_grad_size, device='cuda', dtype=allreduce_dtype)
         # 2. combine unflattening and predivision of unscaled 'raw' gradient
         allreduced_views = apex_C.unflatten(flat_raw, master_grads)
         overflow_buf.zero_()
         amp_C.multi_tensor_scale(65536,
             overflow_buf,
             [master_grads, allreduced_views],
-            scaler.loss_scale() / (distributed_optimizers.world_size() * args.gradient_accumulation_steps))
+            scaler.loss_scale() / (dist.world_size() * args.gradient_accumulation_steps))
         # 3. sum gradient across ranks. Because of the predivision, this averages the gradient
         #torch.distributed.all_reduce(flat_raw)
-        hvd.allreduce(flat_raw, op=hvd.Sum)
+        dist.allreduce_(flat_raw, op=dist.Sum)
         # 4. combine unscaling and unflattening of allreduced gradient
         overflow_buf.zero_()
         amp_C.multi_tensor_scale(65536,
@@ -427,7 +426,7 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step, devic
             if is_main_process():
                 print(("Rank {} :: Gradient overflow.  Skipping step, "  +
                         "reducing loss scale to {}").format(
-                        distributed_optimizers.world_rank(),
+                        dist.world_rank(),
                         scaler.loss_scale()))
             if _amp_state.opt_properties.master_weights:
                 for param in optimizer._amp_stash.all_fp32_from_fp16_params:
@@ -436,16 +435,14 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step, devic
             param.grad = None
     else:
         # toddm: only for fusedadam
-        from optimization import warmup_poly, warmup_linear
-        warmup = warmup_linear
+        from optimization import warmup_linear as warmup
         tmp = warmup(global_step / args.max_steps, args.warmup_proportion)
         for group in optimizer.optimizer.param_groups:
             group['lr'] = args.learning_rate * tmp
         # toddm end
-        print('Taking Step().')
+        
         optimizer.step()
-        if not args.phase2:
-            optimizer.zero_grad()
+        optimizer.zero_grad()
         if _amp_state.opt_properties.master_weights:
             for param in optimizer.optimizer._amp_stash.all_fp32_from_fp16_params:
                 param.grad = None
@@ -489,7 +486,7 @@ def main():
         epoch = 0
         training_steps = 0
 
-        pool = ProcessPoolExecutor(1)
+        #pool = ProcessPoolExecutor(1)
 
         # Note: We loop infinitely over epochs, termination is handled via iteration count
         while True:
@@ -510,11 +507,11 @@ def main():
 
             shared_file_list = {}
 
-            if distributed_optimizers.world_size() > num_files:
-                remainder = distributed_optimizers.world_size() % num_files
-                data_file = files[(f_start_id*distributed_optimizers.world_size()+distributed_optimizers.world_rank() + remainder*f_start_id)%num_files]
+            if dist.world_size() > num_files:
+                remainder = dist.world_size() % num_files
+                data_file = files[(f_start_id*dist.world_size()+dist.world_rank() + remainder*f_start_id)%num_files]
             else:
-                data_file = files[(f_start_id*distributed_optimizers.world_size()+distributed_optimizers.world_rank())%num_files]
+                data_file = files[(f_start_id*dist.world_size()+dist.world_rank())%num_files]
             
             file_name = data_file[data_file.rfind('/'):]
             data_file=args.input_dir + file_name
@@ -537,18 +534,17 @@ def main():
             for f_id in range(f_start_id + 1 , len(files)):
                 
    
-                if distributed_optimizers.world_size() > num_files:
-                    data_file = files[(f_id*distributed_optimizers.world_size()+distributed_optimizers.world_rank() + remainder*f_id)%num_files]
+                if dist.world_size() > num_files:
+                    data_file = files[(f_id*dist.world_size()+dist.world_rank() + remainder*f_id)%num_files]
                 else:
-                    data_file = files[(f_id*distributed_optimizers.world_size()+distributed_optimizers.world_rank())%num_files]
+                    data_file = files[(f_id*dist.world_size()+dist.world_rank())%num_files]
 
+                logger.info("file no %s file %s" % (f_id, previous_file))
                 print("file no %s file %s" % (f_id, previous_file))
 
-                file_name = data_file[data_file.rfind('/'):]
-                data_file=args.input_dir + file_name
                 previous_file = data_file
 
-                dataset_future = pool.submit(create_pretraining_dataset, data_file, args.max_predictions_per_seq, shared_file_list, args)
+                #dataset_future = pool.submit(create_pretraining_dataset, data_file, args.max_predictions_per_seq, shared_file_list, args)
 
                 train_iter = tqdm(train_dataloader, desc="Iteration") if is_main_process() else train_dataloader
                 for step, batch in enumerate(train_iter):
@@ -573,7 +569,7 @@ def main():
                         is_comm_step = training_steps % args.gradient_accumulation_steps == 0
                         with amp.scale_loss(loss, optimizer.optimizer) as scaled_loss:
                             scaled_loss.backward()
-                            if is_comm_step and not args.phase2:
+                            if is_comm_step:
                                 optimizer.synchronize()
                                                                 
                     else:
@@ -581,16 +577,17 @@ def main():
                     average_loss += loss.item()
 
                     if training_steps % args.gradient_accumulation_steps == 0:
-                        global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step, device)
+                        global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
 
                     if global_step >= args.max_steps:
                         last_num_steps = int(training_steps / args.gradient_accumulation_steps) % args.log_freq
                         last_num_steps = args.log_freq if last_num_steps == 0 else last_num_steps
-                        average_loss = torch.tensor(average_loss, dtype=torch.float32).to(device)
+                        average_loss = torch.tensor(average_loss, dtype=torch.float32).cuda()
                         average_loss = average_loss / (last_num_steps * divisor)
-                        #average_loss /= distributed_optimizers.world_size()
+                        #average_loss /= dist.world_size()
                         #hvd.allreduce_(average_loss)
                         if is_main_process():
+                            logger.info("Total Steps:{} Final Loss = {}".format(training_steps / args.gradient_accumulation_steps, average_loss.item()))
                             print("Total Steps:{} Final Loss = {}".format(training_steps / args.gradient_accumulation_steps, average_loss.item()))
 
                     elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
@@ -606,6 +603,7 @@ def main():
                             args.num_steps_per_checkpoint * args.gradient_accumulation_steps) == 0:
                         if is_main_process():
                             # Save a trained model
+                            logger.info("** ** * Saving fine - tuned model ** ** * ")
                             print("** ** * Saving fine - tuned model ** ** * ")
 
                             model_to_save = model.module if hasattr(model,
@@ -634,8 +632,8 @@ def main():
                 # thread.join()
                 # Make sure pool has finished and switch train_dataloader
                 # NOTE: Will block until complete
-                train_dataloader, data_file = dataset_future.result(timeout=None)
-                #train_dataloader, data_file = create_pretraining_dataset(data_file, args.max_predictions_per_seq, shared_file_list, args)
+                #train_dataloader, data_file = dataset_future.result(timeout=None)
+                train_dataloader, data_file = create_pretraining_dataset(data_file, args.max_predictions_per_seq, shared_file_list, args)
 
             epoch += 1
 

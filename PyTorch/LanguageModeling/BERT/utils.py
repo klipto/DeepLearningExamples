@@ -14,10 +14,10 @@
 import torch
 #import torch.distributed as dist
 #import horovod.torch as hvd
-import dist
+import distributed_optimizers
 
 def get_rank():
-    return dist.world_rank()
+    return distributed_optimizers.world_rank()
 
 def is_main_process():
     return get_rank() == 0
