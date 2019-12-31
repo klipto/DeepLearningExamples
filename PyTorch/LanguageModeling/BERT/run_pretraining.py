@@ -68,14 +68,6 @@ logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# This prevents us from using P2P if on P2P-enabled systems
-#os.environ['CUDA_VISIBLE_DEVICES'] = str(distributed_optimizers.local_rank())
-
-# Initialize Horovod with partial ranks
-print('Total number of devices on this node: ' + str(num_devices))
-newcomm = MPI.COMM_WORLD.Split(MPI.COMM_WORLD.rank % num_devices, MPI.COMM_WORLD.rank)
-hvd.init(comm=newcomm)
-
 def create_pretraining_dataset(input_file, max_pred_length, shared_list, args):
 
     train_data = pretraining_dataset(input_file=input_file, max_pred_length=max_pred_length)
@@ -238,6 +230,13 @@ def parse_arguments():
     return args
 
 def setup_training(args):
+    # Initialize Horovod with partial ranks
+    print('Total number of devices on this node: ' + str(num_devices))
+    if args.phase2:
+        hvd.init()
+    else:
+        newcomm = MPI.COMM_WORLD.Split(MPI.COMM_WORLD.rank % num_devices, MPI.COMM_WORLD.rank)
+        hvd.init(comm=newcomm)
 
     assert (torch.cuda.is_available())
 
@@ -342,6 +341,9 @@ def prepare_model_and_optimizer(args, device):
     compression = hvd.Compression.fp16 #if args.fp16_allreduce else hvd.Compression.none
     if args.phase2:
         optimizer = DistributedCpuAdasumOptimizer(optimizer, compression=compression)
+        #optimizer = DistributedOptimizer(optimizer,
+        #                                 backward_passes_per_step=args.gradient_accumulation_steps,
+        #                                 compression=compression)
         print("Created Adasum optimizer for CPU reduction.")
     else:
         optimizer = DistributedAdasumOptimizer(optimizer,
@@ -371,15 +373,21 @@ def prepare_model_and_optimizer(args, device):
         else:
             optimizer.optimizer.load_state_dict(checkpoint['optimizer'])  # , strict=False)
 
-    if distributed_optimizers.local_rank() == 0:
+    if args.phase2:
         print("Broadcasting parameters.")
-        hvd.broadcast_parameters(model.state_dict(), root_rank=0)
-    for param in model.parameters():
-        handle = distributed_optimizers.local_broadcast_async_(param.data, root = 0)
-        handle.wait()
+        hvd.broadcast_parameters(model.state_dict(), root_rank=0)    
+    else:
+        if distributed_optimizers.local_rank() == 0:
+            print("Broadcasting parameters.")
+            hvd.broadcast_parameters(model.state_dict(), root_rank=0)    
+        for param in model.parameters():
+            handle = distributed_optimizers.local_broadcast_async_(param.data, root = 0)
+            handle.wait()
+
     # If we are starting anew, manually initialize apex states so that bcast optimizer state can pass.
     if not args.resume_from_checkpoint:
         optimizer.optimizer._amp_lazy_init()
+
     print("Broadcasting optimizer states.")
     hvd.broadcast_optimizer_state(optimizer.optimizer, root_rank=0)
 
@@ -442,16 +450,16 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step, devic
         for group in optimizer.optimizer.param_groups:
             group['lr'] = args.learning_rate * tmp
         # toddm end
-        print('Taking Step().')
-        optimizer.step()
-        if not args.phase2:
-            optimizer.zero_grad()
-        if _amp_state.opt_properties.master_weights:
-            for param in optimizer.optimizer._amp_stash.all_fp32_from_fp16_params:
-                param.grad = None
 
-        for param in model.parameters():
-            param.grad = None
+        optimizer.step() # zero's grad, too
+        
+        #if not args.phase2:
+        #    optimizer.zero_grad()
+        #if _amp_state.opt_properties.master_weights:
+        #    for param in optimizer.optimizer._amp_stash.all_fp32_from_fp16_params:
+        #        param.grad = None
+        #for param in model.parameters():
+        #    param.grad = None
         global_step += 1
 
     return global_step
@@ -550,9 +558,10 @@ def main():
 
                 dataset_future = pool.submit(create_pretraining_dataset, data_file, args.max_predictions_per_seq, shared_file_list, args)
 
-                train_iter = tqdm(train_dataloader, desc="Iteration") if is_main_process() else train_dataloader
+                #train_iter = tqdm(train_dataloader, desc="Iteration") if is_main_process() else train_dataloader
+                train_iter = train_dataloader
+                batch_start = time.time()                
                 for step, batch in enumerate(train_iter):
-
                     training_steps += 1
                     batch = [t.to(device) for t in batch]
                     input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
@@ -571,18 +580,23 @@ def main():
                     if args.fp16:
                         #with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
                         is_comm_step = training_steps % args.gradient_accumulation_steps == 0
-                        with amp.scale_loss(loss, optimizer.optimizer) as scaled_loss:
+                        with amp.scale_loss(loss, optimizer.optimizer, delay_unscale = False if is_comm_step else True) as scaled_loss:
                             scaled_loss.backward()
                             if is_comm_step and not args.phase2:
                                 optimizer.synchronize()
-                                                                
                     else:
                         loss.backward()
                     average_loss += loss.item()
 
                     if training_steps % args.gradient_accumulation_steps == 0:
+                        step_st = time.time()
                         global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step, device)
-
+                        step_time = time.time() - step_st
+                        if is_main_process():
+                            lr = optimizer.optimizer.param_groups[0]['lr']
+                            print("gs {} Avg_loss {} step {} batch {} lr: {}".format(global_step, average_loss, step_time, time.time() - batch_start, lr), flush=True)
+                        batch_start = time.time()
+                        
                     if global_step >= args.max_steps:
                         last_num_steps = int(training_steps / args.gradient_accumulation_steps) % args.log_freq
                         last_num_steps = args.log_freq if last_num_steps == 0 else last_num_steps
@@ -594,7 +608,7 @@ def main():
                             print("Total Steps:{} Final Loss = {}".format(training_steps / args.gradient_accumulation_steps, average_loss.item()))
 
                     elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
-                        if is_main_process():
+                        if False:#is_main_process():
                             print("Step:{} Average Loss = {} Step Loss = {} LR {}".format(global_step, average_loss / (
                                         args.log_freq * divisor),
                                                                                             loss.item() * args.gradient_accumulation_steps / divisor,

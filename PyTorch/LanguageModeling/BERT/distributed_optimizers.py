@@ -490,14 +490,6 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         loss = None
         if closure is not None:
             loss = closure()
-        #self.synchronize()
-        #if local_rank() == 0:
-        #    self.optimizer.step()
-        #return loss
-    
-        #if self._is_first:
-        #    self._is_first = False
-
         
         local_broadcast_handles = []
         if self._is_first:
@@ -509,7 +501,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
 
         total_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(self.optimizer), 1.0)
         self.optimizer.step()
-
+        
         handles = []
         for index, p in enumerate(amp.master_params(self.optimizer)):
             handle, ctx = None, None
@@ -523,6 +515,13 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 handle = hvd.allreduce_async_(tensor_compressed.data, name=name, op=hvd.Adasum)
             handles.append((handle, p, ctx))
 
+        # keep all local amp scaler's in sync
+        tmp_tensor = torch.cuda.FloatTensor([amp._amp_state.loss_scalers[0]._loss_scale])
+        amp_handle = local_broadcast_async_(tmp_tensor, root=0)
+        self.optimizer.zero_grad()
+        amp_handle.wait()
+        amp._amp_state.loss_scalers[0]._loss_scale = tmp_tensor.item()
+            
         for index, (handle, p, ctx) in enumerate(handles):
             if index % num_devices == local_rank():
                 start = self._starting_models[p]
@@ -533,21 +532,22 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                     delta = self._compression.decompress(delta, ctx)
                     delta.data.div_(scaler.loss_scale)
                     start.data.add_(delta.data)
-                p.data.copy_(start)
+                p.data.copy_(start, True)
                 local_broadcast_handles.append(local_broadcast_async_(p.data, root=index % num_devices))
                 scaler.update_scale(has_overflow)
             else:
                 local_broadcast_handles.append(local_broadcast_async_(p.data, root=index % num_devices))
 
         for handle in local_broadcast_handles:
-            handle.wait()
+            handle.wait()        
+            
         # if we did fp16 training, apex adds the following method
         # to the optimizer.  It does not exist in fp32 training
         if hasattr(self.optimizer,"_master_params_to_model_params"):
             # tell apex to push master parameters to those parameters it uses for fp16
             # training            
             self.optimizer._master_params_to_model_params()
-
+            
         return loss
 
     def zero_grad(self):
