@@ -232,7 +232,7 @@ def parse_arguments():
 def setup_training(args):
     # Initialize Horovod with partial ranks
     print('Total number of devices on this node: ' + str(num_devices))
-    if args.phase2:
+    if False:#args.phase2:
         hvd.init()
     else:
         newcomm = MPI.COMM_WORLD.Split(MPI.COMM_WORLD.rank % num_devices, MPI.COMM_WORLD.rank)
@@ -339,7 +339,7 @@ def prepare_model_and_optimizer(args, device):
 
     from distributed_optimizers import DistributedOptimizer, DistributedAdasumOptimizer, DistributedCpuAdasumOptimizer
     compression = hvd.Compression.fp16 #if args.fp16_allreduce else hvd.Compression.none
-    if args.phase2:
+    if False: #args.phase2:
         optimizer = DistributedCpuAdasumOptimizer(optimizer, compression=compression)
         #optimizer = DistributedOptimizer(optimizer,
         #                                 backward_passes_per_step=args.gradient_accumulation_steps,
@@ -373,23 +373,24 @@ def prepare_model_and_optimizer(args, device):
         else:
             optimizer.optimizer.load_state_dict(checkpoint['optimizer'])  # , strict=False)
 
-    if args.phase2:
+    if False:#args.phase2:
         print("Broadcasting parameters.")
         hvd.broadcast_parameters(model.state_dict(), root_rank=0)    
     else:
-        if distributed_optimizers.local_rank() == 0:
-            print("Broadcasting parameters.")
-            hvd.broadcast_parameters(model.state_dict(), root_rank=0)    
-        for param in model.parameters():
-            handle = distributed_optimizers.local_broadcast_async_(param.data, root = 0)
-            handle.wait()
+        if not args.resume_from_checkpoint:
+            if distributed_optimizers.local_rank() == 0:
+                print("Broadcasting parameters.")
+                hvd.broadcast_parameters(model.state_dict(), root_rank=0)    
+            for param in model.parameters():
+                handle = distributed_optimizers.local_broadcast_async_(param.data, root = 0)
+                handle.wait()
 
     # If we are starting anew, manually initialize apex states so that bcast optimizer state can pass.
     if not args.resume_from_checkpoint:
         optimizer.optimizer._amp_lazy_init()
 
     print("Broadcasting optimizer states.")
-    hvd.broadcast_optimizer_state(optimizer.optimizer, root_rank=0)
+    #hvd.broadcast_optimizer_state(optimizer.optimizer, root_rank=0)
 
     return model, optimizer, checkpoint, global_step
 
@@ -582,7 +583,7 @@ def main():
                         is_comm_step = training_steps % args.gradient_accumulation_steps == 0
                         with amp.scale_loss(loss, optimizer.optimizer, delay_unscale = False if is_comm_step else True) as scaled_loss:
                             scaled_loss.backward()
-                            if is_comm_step and not args.phase2:
+                            if is_comm_step:# and not args.phase2:
                                 optimizer.synchronize()
                     else:
                         loss.backward()
@@ -627,7 +628,7 @@ def main():
                             if args.resume_step < 0 or not args.phase2:
                                 output_save_file = os.path.join(args.output_dir, "ckpt_{}.pt".format(global_step))
                             else:
-                                output_save_file = os.path.join(args.output_dir, "ckpt_{}.pt".format(global_step + args.phase1_end_step))
+                                output_save_file = os.path.join(args.output_dir, "phase2ckpt_{}.pt".format(global_step + args.phase1_end_step))
                             if args.do_train:
                                 torch.save({'model': model_to_save.state_dict(),
                                             'optimizer': optimizer.optimizer.state_dict(),
