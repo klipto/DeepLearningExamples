@@ -593,7 +593,7 @@ def main():
                                             delay_unscale = False if is_comm_step else True) as scaled_loss:
                             t4 = time.time()
                             scaled_loss.backward()
-                            average_loss += loss.item()
+                            #average_loss += loss.item()
                             t5 = time.time()
                             if is_comm_step:# and not args.phase2:
                                 t6 = time.time()
@@ -601,7 +601,7 @@ def main():
                                 t7 = time.time()
                     else:
                         loss.backward()
-                        average_loss += loss.item()
+                    average_loss += loss.item()
 
                     if training_steps % args.gradient_accumulation_steps == 0:
                         #step_st = time.time()

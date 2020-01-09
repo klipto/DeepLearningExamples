@@ -560,8 +560,10 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
             # training            
             self.optimizer._master_params_to_model_params()
         t7 = time.time()
-        print("ZZZ", t7-t0,
-              t7-t6, t6-t5, t5-t4, t4-t3, t3-t2, t2-t1, t1-t0, flush=True)
+
+        if world_rank() == 0:
+            print("ZZZ", t7-t0,
+                  t7-t6, t6-t5, t5-t4, t4-t3, t3-t2, t2-t1, t1-t0, flush=True)
         return loss
 
     def zero_grad(self):
