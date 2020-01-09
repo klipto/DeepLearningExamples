@@ -12,7 +12,7 @@ from torch.nn.utils import clip_grad_norm_
 from apex.optimizers import FusedAdam
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
-
+import time
 from apex import amp
 
 def local_init():
