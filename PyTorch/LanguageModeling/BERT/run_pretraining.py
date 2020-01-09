@@ -288,7 +288,7 @@ def prepare_model_and_optimizer(args, device):
         global_step = 0
     else:
         if args.resume_step == -1:
-            model_names = [f for f in os.listdir(args.output_dir) if f.endswith(".pt")]
+            model_names = [f for f in os.listdir(args.output_dir) if f.endswith(".pt") and not f.startswith('phase2')]
             args.resume_step = max([int(x.split('.pt')[0].split('_')[1].strip()) for x in model_names])
         global_step = args.resume_step
 
@@ -581,10 +581,13 @@ def main():
                     if args.fp16:
                         #with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
                         is_comm_step = training_steps % args.gradient_accumulation_steps == 0
-                        with amp.scale_loss(loss, optimizer.optimizer, delay_unscale = False if is_comm_step else True) as scaled_loss:
+                        with amp.scale_loss(loss, optimizer.optimizer,
+                                            delay_overflow_check = False if is_comm_step else True,
+                                            delay_unscale = False if is_comm_step else True) as scaled_loss:
                             scaled_loss.backward()
                             if is_comm_step:# and not args.phase2:
                                 optimizer.synchronize()
+                            apex_exit_time = time.time()
                     else:
                         loss.backward()
                     average_loss += loss.item()
@@ -595,7 +598,7 @@ def main():
                         step_time = time.time() - step_st
                         if is_main_process():
                             lr = optimizer.optimizer.param_groups[0]['lr']
-                            print("gs {} Avg_loss {} step {} batch {} lr: {}".format(global_step, average_loss, step_time, time.time() - batch_start, lr), flush=True)
+                            print("gs {} Avg_loss {} step {} batch {} exit {} lr: {}".format(global_step, average_loss, step_time, time.time() - batch_start, step_st - apex_exit_time, lr), flush=True)
                         batch_start = time.time()
                         
                     if global_step >= args.max_steps:
