@@ -84,7 +84,7 @@ def Timer(name):
     end_event.record()
     torch.cuda.synchronize()  # Wait for the events to be recorded!
     elapsed_time_ms = start_event.elapsed_time(end_event)
-    if world_rank() == 0:
+    if distributed_optimizers.world_rank() == 0:
         print("timer:", name, elapsed_time_ms, flush=True)
 
 
@@ -604,8 +604,8 @@ def main():
                         with amp.scale_loss(loss, optimizer.optimizer,
                                             delay_overflow_check = True,
                                             delay_unscale = False if is_comm_step else True) as scaled_loss:
-                            with Timer("backward"):
-                                scaled_loss.backward()
+                            #with Timer("backward"):
+                            scaled_loss.backward()
                             if is_comm_step:# and not args.phase2:
                                 optimizer.synchronize()
                     else:
@@ -614,7 +614,8 @@ def main():
 
                     if training_steps % args.gradient_accumulation_steps == 0:
                         #step_st = time.time()
-                        global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step, device)
+                        with Timer("step"):
+                            global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step, device)
                         
                         if (global_step - 1) % args.log_freq == 0:
                             if is_main_process():
