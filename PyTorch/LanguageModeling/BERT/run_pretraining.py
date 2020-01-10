@@ -71,6 +71,23 @@ logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+from contextlib import contextmanager
+
+@contextmanager
+def Timer(name):
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+
+    yield None
+
+    end_event.record()
+    torch.cuda.synchronize()  # Wait for the events to be recorded!
+    elapsed_time_ms = start_event.elapsed_time(end_event)
+    if world_rank() == 0:
+        print("timer:", name, elapsed_time_ms, flush=True)
+
+
 def create_pretraining_dataset(input_file, max_pred_length, shared_list, args):
 
     train_data = pretraining_dataset(input_file=input_file, max_pred_length=max_pred_length)
@@ -566,15 +583,12 @@ def main():
                 train_iter = train_dataloader
                 batch_start = time.time()                
                 for step, batch in enumerate(train_iter):
-                    t0 = time.time()
                     training_steps += 1
                     batch = [t.to(device) for t in batch]
                     input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
-                    t1 = time.time()
                     loss = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask,
                                     masked_lm_labels=masked_lm_labels, next_sentence_label=next_sentence_labels,
                                     checkpoint_activations=args.checkpoint_activations)
-                    t2 = time.time()
                     if args.n_gpu > 1:
                         loss = loss.mean()  # mean() to average on multi-gpu.
 
@@ -586,33 +600,22 @@ def main():
                             divisor = 1.0
                     if args.fp16:
                         #with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
-                        t3 = time.time()
                         is_comm_step = training_steps % args.gradient_accumulation_steps == 0
                         with amp.scale_loss(loss, optimizer.optimizer,
-                                            delay_overflow_check = True, #False if is_comm_step else True,
+                                            delay_overflow_check = True,
                                             delay_unscale = False if is_comm_step else True) as scaled_loss:
-                            t4 = time.time()
-                            scaled_loss.backward()
-                            average_loss += loss.item()
-                            t5 = time.time()
+                            with Timer("backward"):
+                                scaled_loss.backward()
                             if is_comm_step:# and not args.phase2:
-                                t6 = time.time()
                                 optimizer.synchronize()
-                                t7 = time.time()
                     else:
                          loss.backward()
-                    #average_loss += loss.item()
+                    average_loss += loss.item()
 
                     if training_steps % args.gradient_accumulation_steps == 0:
                         #step_st = time.time()
-                        t8 = time.time()
                         global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step, device)
-                        t9 = time.time()
-                        if is_main_process():
-                            print("XXX ", global_step,
-                                  t9-t0, t9-t8, t8-t7, t7-t6, t6-t5, t5-t4, t4-t3, t3-t2, t2-t1, t1-t0,
-                                  flush=True)
-                            
+                        
                         if (global_step - 1) % args.log_freq == 0:
                             if is_main_process():
                                 amlrun.log('lr', optimizer.optimizer.param_groups[0]['lr'])

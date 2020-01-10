@@ -361,6 +361,8 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
 
         self._register_hooks()
 
+        self.one = torch.cuda.FloatTensor([1.0])
+
     def set_backward_passes_per_step(self, passes):
         self.backward_passes_per_step = passes
         for p in self._allreduce_delay:
@@ -377,70 +379,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                     grad_acc.register_hook(self._make_hook(p))
                     self._grad_accs.append(grad_acc)
 
-    def _allreduce_delta(self,p):        
-        handle = local_reduce_mean_async_(p.grad.data)
-        
-        if local_rank() == 0:
-            group = None
-            found = False
-            for group in self.optimizer.param_groups:
-                if any([p is v for v in group['params']]):
-                    found = True
-                    break
-            assert group is not None
-            assert found
-            name = self._parameter_names.get(p)
-            handle.wait()
-            
-            delta = self.optimizer.step_one(p, group)
-            
-            tensor_compressed, ctx = self._compression.compress(delta)
-            handle = hvd.allreduce_async_(tensor_compressed.data, name=name, op=hvd.Adasum)
-            return handle, ctx
-
-        handle.wait()
-        return handle, None
-
-    def _allreduce_delta2(self,p):        
-        handle = local_reduce_mean_async_(p.grad.data)
-        
-        if local_rank() == 0:
-            stashed_params = []
-            stashed_step = None
-            for group in self.optimizer.param_groups:
-                stashed_params.append(group['params'])
-                # only want to step on p
-                if any([p is v for v in group['params']]):
-                    group['params'] = [p]
-                    stashed_step = group.get('step', 0)
-                else:
-                    group['params'] = []
-
-            start = self._starting_models[p]
-            start.data.copy_(p)
-            name = self._parameter_names.get(p)
-            
-            handle.wait()
-            self.optimizer.step()
-            p.data.sub_(start)
-
-            # allreduce as before
-            tensor_compressed, ctx = self._compression.compress(p)
-            handle = hvd.allreduce_async_(tensor_compressed.data, name=name, op=hvd.Adasum)
-
-            # reset stashed parameters
-            for stashed, group in zip(stashed_params, self.optimizer.param_groups):
-                group['params'] = stashed
-
-            return handle, ctx
-
-        handle.wait()
-        return True, None #True -> Not None but we already waited
-    
     def _allreduce_grad_async(self, p):
-        #return self._allreduce_delta(p)
-        #return self._allreduce_delta2(p)
-        name = self._parameter_names.get(p)
         tensor = p.grad
         tensor_compressed, ctx = self._compression.compress(tensor)
         handle = local_allreduce_mean_async_(tensor_compressed.data)
@@ -499,24 +438,34 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 self._starting_models[p].data.copy_(p.data)
                 self._scalers[p] = DynamicLossScaler(init_scale=2**15)
 
-
         amp_scale = amp._amp_state.loss_scalers[0]
-        #had_overflow = amp_scale.update_scale()
-        
-        #if had_overflow == 0:
+        #clear_step_as_tensor = 1 - amp_scale._overflow_buf
+        had_overflow = amp_scale.update_scale()
         #t0 = time.time()
-        #total_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(self.optimizer), 1.0)
-        for param in amp.master_params(self.optimizer):
-            param.grad.data.mul_(1 - amp_scale._overflow_buf)
-            
-        #t1 = time.time()
-        self.optimizer.step()
-        #t2 = time.time()
-        #else:
-        #    print(("Rank {} :: Gradient overflow.  Skipping step, "  +
-        #           "reducing loss scale to {}").format(
-        #               hvd.rank(), amp_scale.loss_scale()))
-                                                                                                
+        if had_overflow == 0:
+            torch.nn.utils.clip_grad_norm_(amp.master_params(self.optimizer), 1.0)
+            # total_norm = 0.0
+            # for param in amp.master_params(self.optimizer):
+            #     a = param.grad.data.view(-1)
+            #     ssq = torch.dot(a, a)
+            #     total_norm += ssq
+            # total_norm = torch.sqrt(total_norm)
+            # clip_coeff = 1.0 / (total_norm + 1e-6)
+            # clip_coeff = torch.min(clip_coeff, self.one)
+            # clip_coeff *= clear_step_as_tensor
+            # for index, param in enumerate(amp.master_params(self.optimizer)):
+            #     if index % num_devices == local_rank():
+            #         param.grad.data.mul_(clear_step_as_tensor)
+            #t1 = time.time()
+            self.optimizer.step()
+            #t2 = time.time()
+        else:
+            #t1 = time.time()
+            #t2 = time.time()
+            print(("Rank {} :: Gradient overflow.  Skipping step, "  +
+                   "reducing loss scale to {}").format(
+                       world_rank(), amp_scale.loss_scale()))
+                                                                                                           
         handles = []
         for index, p in enumerate(amp.master_params(self.optimizer)):
             handle, ctx = None, None
@@ -528,7 +477,8 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 p.data.mul_(scaler.loss_scale)
                 tensor_compressed, ctx = self._compression.compress(p)
                 handle = hvd.allreduce_async_(tensor_compressed.data, name=name, op=hvd.Adasum)
-            handles.append((handle, p, ctx))
+            handles.append((index, handle, p, ctx))
+            
         #t3 = time.time()
         # keep all local amp scaler's in sync
         tmp_tensor = torch.cuda.FloatTensor([amp._amp_state.loss_scalers[0]._loss_scale])
@@ -536,8 +486,10 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         self.optimizer.zero_grad()
         amp_handle.wait()
         amp._amp_state.loss_scalers[0]._loss_scale = tmp_tensor.item()
+        #had_overflow = amp_scale.update_scale()
         #t4 = time.time()
-        for index, (handle, p, ctx) in enumerate(handles):
+
+        for index, handle, p, ctx in handles:
             if index % num_devices == local_rank():
                 start = self._starting_models[p]
                 scaler = self._scalers[p]
@@ -565,8 +517,8 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         #t7 = time.time()
 
         #if world_rank() == 0:
-        #    print("ZZZ", t7-t0,
-        #          t7-t6, t6-t5, t5-t4, t4-t3, t3-t2, t2-t1, t1-t0, flush=True)
+        #    print("ZZZ",
+        #          t7-t0, t7-t6, t6-t5, t5-t4, t4-t3, t3-t2, t2-t1, t1-t0, flush=True)
         return loss
 
     def zero_grad(self):
