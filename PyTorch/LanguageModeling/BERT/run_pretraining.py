@@ -589,19 +589,19 @@ def main():
                         t3 = time.time()
                         is_comm_step = training_steps % args.gradient_accumulation_steps == 0
                         with amp.scale_loss(loss, optimizer.optimizer,
-                                            delay_overflow_check = False if is_comm_step else True,
+                                            delay_overflow_check = True, #False if is_comm_step else True,
                                             delay_unscale = False if is_comm_step else True) as scaled_loss:
                             t4 = time.time()
                             scaled_loss.backward()
-                            #average_loss += loss.item()
+                            average_loss += loss.item()
                             t5 = time.time()
                             if is_comm_step:# and not args.phase2:
                                 t6 = time.time()
                                 optimizer.synchronize()
                                 t7 = time.time()
                     else:
-                        loss.backward()
-                    average_loss += loss.item()
+                         loss.backward()
+                    #average_loss += loss.item()
 
                     if training_steps % args.gradient_accumulation_steps == 0:
                         #step_st = time.time()

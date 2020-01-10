@@ -500,15 +500,18 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 self._scalers[p] = DynamicLossScaler(init_scale=2**15)
 
 
-        #amp_scale = amp._amp_state.loss_scalers[0]
+        amp_scale = amp._amp_state.loss_scalers[0]
         #had_overflow = amp_scale.update_scale()
         
         #if had_overflow == 0:
-        t0 = time.time()
-        total_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(self.optimizer), 1.0)
-        t1 = time.time()
+        #t0 = time.time()
+        #total_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(self.optimizer), 1.0)
+        for param in amp.master_params(self.optimizer):
+            param.grad.data.mul_(1 - amp_scale._overflow_buf)
+            
+        #t1 = time.time()
         self.optimizer.step()
-        t2 = time.time()
+        #t2 = time.time()
         #else:
         #    print(("Rank {} :: Gradient overflow.  Skipping step, "  +
         #           "reducing loss scale to {}").format(
@@ -526,14 +529,14 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 tensor_compressed, ctx = self._compression.compress(p)
                 handle = hvd.allreduce_async_(tensor_compressed.data, name=name, op=hvd.Adasum)
             handles.append((handle, p, ctx))
-        t3 = time.time()
+        #t3 = time.time()
         # keep all local amp scaler's in sync
         tmp_tensor = torch.cuda.FloatTensor([amp._amp_state.loss_scalers[0]._loss_scale])
         amp_handle = local_broadcast_async_(tmp_tensor, root=0)
         self.optimizer.zero_grad()
         amp_handle.wait()
         amp._amp_state.loss_scalers[0]._loss_scale = tmp_tensor.item()
-        t4 = time.time()
+        #t4 = time.time()
         for index, (handle, p, ctx) in enumerate(handles):
             if index % num_devices == local_rank():
                 start = self._starting_models[p]
@@ -549,21 +552,21 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 scaler.update_scale(has_overflow)
             else:
                 local_broadcast_handles.append(local_broadcast_async_(p.data, root=index % num_devices))
-        t5 = time.time()
+        #t5 = time.time()
         for handle in local_broadcast_handles:
             handle.wait()        
-        t6 = time.time()            
+        #t6 = time.time()            
         # if we did fp16 training, apex adds the following method
         # to the optimizer.  It does not exist in fp32 training
         if hasattr(self.optimizer,"_master_params_to_model_params"):
             # tell apex to push master parameters to those parameters it uses for fp16
             # training            
             self.optimizer._master_params_to_model_params()
-        t7 = time.time()
+        #t7 = time.time()
 
-        if world_rank() == 0:
-            print("ZZZ", t7-t0,
-                  t7-t6, t6-t5, t5-t4, t4-t3, t3-t2, t2-t1, t1-t0, flush=True)
+        #if world_rank() == 0:
+        #    print("ZZZ", t7-t0,
+        #          t7-t6, t6-t5, t5-t4, t4-t3, t3-t2, t2-t1, t1-t0, flush=True)
         return loss
 
     def zero_grad(self):
