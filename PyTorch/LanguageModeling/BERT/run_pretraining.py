@@ -336,15 +336,15 @@ def prepare_model_and_optimizer(args, device):
             optimizer_grouped_parameters.append({'params': [p], 'weight_decay': 0.00, 'name': n})
             names.append({'params': [n], 'weight_decay': 0.00})
 
-    #optimizer = BertLAMB(optimizer_grouped_parameters,
-    #                     lr=args.learning_rate,
-    #                     warmup=args.warmup_proportion,
-    #                     t_total=args.max_steps)
-    optimizer = FusedAdam(optimizer_grouped_parameters,
-                          lr=args.learning_rate,
-                          betas=(0.9, 0.999),
-                          bias_correction=True,
-                          eps=1e-6)
+    optimizer = BertLAMB(optimizer_grouped_parameters,
+                         lr=args.learning_rate,
+                         warmup=args.warmup_proportion,
+                         t_total=args.max_steps)
+    #optimizer = FusedAdam(optimizer_grouped_parameters,
+    #                      lr=args.learning_rate,
+    #                      betas=(0.9, 0.999),
+    #                      bias_correction=True,
+    #                      eps=1e-6)
 
     if args.fp16:
         if args.loss_scale == 0:
@@ -465,17 +465,17 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step, devic
             param.grad = None
     else:
         # toddm: only for fusedadam
-        from optimization import warmup_poly, warmup_linear
-        warmup = warmup_linear
-        tmp = warmup(global_step / args.max_steps, args.warmup_proportion)
-        for group in optimizer.optimizer.param_groups:
-            group['lr'] = args.learning_rate * tmp
+        #from optimization import warmup_poly, warmup_linear
+        #warmup = warmup_linear
+        #tmp = warmup(global_step / args.max_steps, args.warmup_proportion)
+        #for group in optimizer.optimizer.param_groups:
+        #    group['lr'] = args.learning_rate * tmp
         # toddm end
 
         optimizer.step() # zero's grad, too
         
         #if not args.phase2:
-        #    optimizer.zero_grad()
+        # optimizer.zero_grad()
         #if _amp_state.opt_properties.master_weights:
         #    for param in optimizer.optimizer._amp_stash.all_fp32_from_fp16_params:
         #        param.grad = None
@@ -604,8 +604,8 @@ def main():
                         with amp.scale_loss(loss, optimizer.optimizer,
                                             delay_overflow_check = True,
                                             delay_unscale = False if is_comm_step else True) as scaled_loss:
-                            with Timer("backward"):
-                                scaled_loss.backward()
+                            #with Timer("backward"):
+                            scaled_loss.backward()
                             if is_comm_step:# and not args.phase2:
                                 optimizer.synchronize()
                     else:
@@ -621,6 +621,7 @@ def main():
                                 amlrun.log('lr', optimizer.optimizer.param_groups[0]['lr'])
                                 amlrun.log('train_loss', average_loss / args.log_freq)
                                 amlrun.log('throughput', (time.time() - batch_start) / args.log_freq)
+                                print("XXX", global_step, average_loss / args.log_freq, flush=True)
                             average_loss = 0
                             batch_start = time.time()
                             
