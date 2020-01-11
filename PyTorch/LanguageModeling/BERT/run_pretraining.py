@@ -400,10 +400,11 @@ def prepare_model_and_optimizer(args, device):
         if not args.resume_from_checkpoint:
             if distributed_optimizers.local_rank() == 0:
                 print("Broadcasting parameters.")
-                hvd.broadcast_parameters(model.state_dict(), root_rank=0)    
-            for param in model.parameters():
-                handle = distributed_optimizers.local_broadcast_async_(param.data, root = 0)
-                handle.wait()
+                hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+            print("warning:no broadcast",flush=True)
+            #for param in model.parameters():
+            #    handle = distributed_optimizers.local_broadcast_async_(param.data, root = 0)
+            #    handle.wait()
 
     # If we are starting anew, manually initialize apex states so that bcast optimizer state can pass.
     if not args.resume_from_checkpoint:
@@ -601,6 +602,7 @@ def main():
                     if args.fp16:
                         #with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
                         #is_comm_step = training_steps % args.gradient_accumulation_steps == 0
+                        optimizer.optimizer._prepare_amp_backward()
                         with amp.scale_loss(loss, optimizer.optimizer,
                                             delay_overflow_check = True,
                                             delay_unscale = True) as scaled_loss: #False if is_comm_step else True
@@ -608,6 +610,8 @@ def main():
                             scaled_loss.backward()
                             #if is_comm_step:# and not args.phase2:
                             #    optimizer.synchronize()
+                        if amp._amp_state.opt_properties.patch_torch_functions:
+                            amp._amp_state.handle._clear_cache()
                     else:
                          loss.backward()
                     average_loss += loss.item()
