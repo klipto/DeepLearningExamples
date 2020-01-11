@@ -350,7 +350,7 @@ def prepare_model_and_optimizer(args, device):
         if args.loss_scale == 0:
             # optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
             model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale="dynamic", 
-                    master_weights=False if args.accumulate_into_fp16 else True)
+                                              master_weights=False)#False if args.accumulate_into_fp16 else True)
         else:
             # optimizer = FP16_Optimizer(optimizer, static_loss_scale=args.loss_scale)
             model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale=args.loss_scale,
@@ -600,14 +600,14 @@ def main():
                             divisor = 1.0
                     if args.fp16:
                         #with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
-                        is_comm_step = training_steps % args.gradient_accumulation_steps == 0
+                        #is_comm_step = training_steps % args.gradient_accumulation_steps == 0
                         with amp.scale_loss(loss, optimizer.optimizer,
                                             delay_overflow_check = True,
-                                            delay_unscale = False if is_comm_step else True) as scaled_loss:
+                                            delay_unscale = True) as scaled_loss: #False if is_comm_step else True
                             #with Timer("backward"):
                             scaled_loss.backward()
-                            if is_comm_step:# and not args.phase2:
-                                optimizer.synchronize()
+                            #if is_comm_step:# and not args.phase2:
+                            #    optimizer.synchronize()
                     else:
                          loss.backward()
                     average_loss += loss.item()

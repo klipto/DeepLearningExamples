@@ -22,6 +22,10 @@ def local_init():
                                          world_size=num_devices,
                                          rank=local_rank())
 
+def local_allreduce_sum_(tensor, rank):
+    torch.distributed.reduce(tensor, dst = rank, async_op=False)
+    return None
+
 def local_allreduce_mean_async_(tensor, root=0):
     import torch
     tensor.div_(local_size())
@@ -362,6 +366,10 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         self._register_hooks()
 
         self.one = torch.cuda.FloatTensor([1.0])
+        
+        #for p in amp.master_params(self.optimizer):
+        #    self._starting_models[p] = torch.zeros_like(p, requires_grad=False).float()
+        #    self._starting_models[p].data.copy_(p.data)
 
     def set_backward_passes_per_step(self, passes):
         self.backward_passes_per_step = passes
@@ -369,23 +377,71 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
             self._allreduce_delay[p] = self.backward_passes_per_step
 
     def _register_hooks(self):
+        self.optimizer._amp_lazy_init() # why they lazily init is beyond me... its such a headache.
+        param_index = 0
         for param_group in self.optimizer.param_groups:
+            assert len(param_group['params']) == 1, "requires 1 parameter per group"
             for p in param_group['params']:
                 if p.requires_grad:
-                    p.grad = p.data.new(p.size()).zero_()
-                    self._requires_update.add(p)
+                    start = torch.empty_like(p, requires_grad=False).float()
+                    master = torch.empty_like(start, requires_grad=False)
+                    master_grad = torch.empty_like(start, requires_grad=False)#p.data.new(p.size()).zero_().float()
+                    #self._requires_update.add(p)
                     p_tmp = p.expand_as(p)
                     grad_acc = p_tmp.grad_fn.next_functions[0][0]
-                    grad_acc.register_hook(self._make_hook(p))
+                    grad_acc.register_hook(self._make_hook(param_index, param_group, p, start, master, master_grad))
                     self._grad_accs.append(grad_acc)
+                    param_index += 1
+                    
+    def _allreduce_grad_async(self, param_index, group, p, start, master, master_grad):
 
-    def _allreduce_grad_async(self, p):
-        tensor = p.grad
-        tensor_compressed, ctx = self._compression.compress(tensor)
-        handle = local_allreduce_mean_async_(tensor_compressed.data)
-        return handle, (ctx, tensor_compressed)
+        fp16_grad = self.optimizer._amp_stash.all_fp16_params[param_index]
+        owner = param_index % num_devices
+        local_allreduce_sum_(fp16_grad, owner)
 
-    def _make_hook(self, p):
+        amp_scale = amp._amp_state.loss_scalers[0]
+        # scale fp16 to fp32 gradients.  this call also computes had_overflow in scaler._overflow_buf
+        amp_C.multi_tensor_scale(65536,
+                                 amp_scale._overflow_buf,
+                                 [[fp16_grad], [master_grad]],
+                                 1.0 / (amp_scale.loss_scale() * num_devices))
+        
+        handle, ctx = True, None
+        if local_rank() == owner:
+            name = self._parameter_names.get(p)
+            had_overflow = amp_scale._overflow_buf.item()
+            if had_overflow == 0:                
+
+                a = master_grad.data.view(-1)
+                total_norm = torch.sqrt(torch.dot(a, a))
+                clip_coeff = 1.0 / (total_norm + 1e-6)
+                clip_coeff = torch.min(clip_coeff, self.one)
+                master_grad.data.mul_(clip_coeff)
+                
+                start.data.copy_(p.data)
+                master.data.copy_(p.data)
+                
+                tmp = self.optimizer.param_groups
+                self.optimizer.param_groups = [group]
+                #clear_step_as_tensor = 1 - amp_scale._overflow_buf
+                #fp32_grad.data.mul_(clear_step_as_tensor)
+                #p.grad = master_grad
+                master.grad = master_grad
+                group['params'] = [master]                
+                self.optimizer.step()
+                group['params'] = [p]
+                self.optimizer.param_groups = tmp
+                
+                master.data.sub(start.data)
+                fp16_grad.data.copy_(master.data)
+            else:
+                print("layer overflow", param_index, flush=True)
+                fp16_grad.data.zero_()
+            handle = hvd.allreduce_async_(fp16_grad.data, name=name, op=hvd.Adasum)
+            
+        return handle, (param_index, start, fp16_grad)
+
+    def _make_hook(self, param_index, group, p, start, master, master_grad):
         def hook(*ignore):
             if p in self._handles and self._handles[p][0] is not None:
                 if self._allreduce_delay[p] <= 0:
@@ -399,24 +455,28 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
             handle, ctx = None, None
             self._allreduce_delay[p] -= 1
             if self._allreduce_delay[p] == 0:
-                handle, ctx = self._allreduce_grad_async(p)
+                handle, ctx = self._allreduce_grad_async(param_index, group, p, start, master, master_grad)
             self._handles[p] = (handle, ctx)
         return hook
 
     def synchronize(self):
+        assert False, "do not call me"
         missing_p = self._requires_update - set(self._handles.keys())
         for p in missing_p:
+            assert False, "should not be here"
             handle, ctx = self._allreduce_grad_async(p)
             self._handles[p] = (handle, ctx)
 
         for p, value in self._handles.items():
+            assert False, "should not be here"
             handle, ctx = value
             if handle is None:
                 handle, ctx = self._allreduce_grad_async(p)
                 self._handles[p] = (handle, ctx)
 
         for p, (handle, ctx) in self._handles.items():
-            handle.wait()
+            #hvd.synchronize(handle)
+            #handle.wait()
             self._allreduce_delay[p] = self.backward_passes_per_step
 
         self._handles.clear()
@@ -429,8 +489,34 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         loss = None
         if closure is not None:
             loss = closure()
+
+        had_overflow = amp._amp_state.loss_scalers[0].update_scale()        
+        missing_p = self._requires_update - set(self._handles.keys())
+        assert len(missing_p) == 0
+
+        assert had_overflow == 0
         
         local_broadcast_handles = []
+        for index, p in enumerate(amp.master_params(self.optimizer)):
+            self._allreduce_delay[p] = self.backward_passes_per_step
+            if index % num_devices == local_rank():
+                handle, (param_index, start, delta) = self._handles[p]
+                hvd.synchronize(handle)
+                if had_overflow == 0:
+                    start.data.add_(delta)
+                p.data.copy_(start, True)
+                local_broadcast_handles.append(local_broadcast_async_(p.data, root=index % num_devices))
+            else:
+                local_broadcast_handles.append(local_broadcast_async_(p.data, root=index % num_devices))
+
+        self._handles.clear()
+        amp._amp_state.loss_scalers[0].clear_overflow_state()
+        
+        for handle in local_broadcast_handles:
+            handle.wait()        
+            
+        return loss
+        
         if self._is_first:
             self._is_first = False
             for p in amp.master_params(self.optimizer):
