@@ -194,36 +194,40 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         local_reduce_sum_(p.grad, owner)
 
         if self._is_first:
-            start.data.copy_(p.data)            
+            start.data.copy_(p.data, True)
         
         handle = True
         if local_rank() == owner:
             amp_scale = amp._amp_state.loss_scalers[0]
-            amp_C.multi_tensor_scale(65536,
-                                     amp_scale._overflow_buf,
-                                     [[p.grad], [master.grad]],
-                                     1.0 / (num_devices * amp_scale.loss_scale()))
-            
-            name = self._parameter_names.get(p)
-            had_overflow = amp_scale._overflow_buf.item()
-            
-            if had_overflow == 0:
+
+            s = torch.cuda.Stream()
+            with torch.cuda.stream(s):
+                amp_C.multi_tensor_scale(65536,
+                                         amp_scale._overflow_buf,
+                                         [[p.grad], [master.grad]],
+                                         1.0 / (num_devices * amp_scale.loss_scale()))
                 norm = master.grad.norm()
                 clip_coeff = 1.0 / (norm + 1e-6)
                 clip_coeff = torch.min(clip_coeff, self.one)
                 master.grad.data.mul_(clip_coeff)
-
-                master.data.copy_(p.data)
-                
+            
+            master.data.copy_(p.data, True)            
+            name = self._parameter_names.get(p)
+            had_overflow = amp_scale._overflow_buf.item()
+            
+            if had_overflow == 0:                                
                 tmp = self.optimizer.param_groups
                 self.optimizer.param_groups = [group]
-                group['params'] = [master]                
+                group['params'] = [master]
+
+                torch.cuda.default_stream().wait_stream(s)
+                
                 self.optimizer.step()
                 group['params'] = [p]
                 self.optimizer.param_groups = tmp
                 
                 master.data.sub_(start.data)            
-                p.grad.data.copy_(master.data)
+                p.grad.data.copy_(master.data, True)
             else:
                 p.grad.data.zero_()
             
@@ -240,17 +244,17 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
 
         self._is_first = False        
 
-        if world_rank() == 0 and had_overflow == 1:
+        if had_overflow == 1:
             print("overflow", amp._amp_state.loss_scalers[0].loss_scale(), flush=True)
 
         local_broadcast_handles = []
-        for param_index in range(len(self._handles)):
+        for param_index in reversed(range(len(self._handles))):
             handle, ctx = self._handles[param_index]
             p, param_index, start, delta  = ctx
             owner = param_index % num_devices
             if owner == local_rank():
                 hvd.synchronize(handle)
-                start.data.add_(delta)                
+                start.data.add_(delta)
                 p.data.copy_(start)
                 local_broadcast_handles.append(local_broadcast_async_(p.data, root=owner))
             else:

@@ -605,8 +605,8 @@ def main():
                         with amp.scale_loss(loss, optimizer.optimizer,
                                             delay_overflow_check = True,
                                             delay_unscale = True) as scaled_loss: #False if is_comm_step else True
-                            #with Timer("backward"):
-                            scaled_loss.backward()
+                            with Timer("backward"):
+                                scaled_loss.backward()
                             #if is_comm_step:# and not args.phase2:
                             #    optimizer.synchronize()
                         if amp._amp_state.opt_properties.patch_torch_functions:
