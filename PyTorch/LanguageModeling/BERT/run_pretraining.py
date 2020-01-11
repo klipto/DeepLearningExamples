@@ -344,8 +344,8 @@ def prepare_model_and_optimizer(args, device):
                           lr=args.learning_rate,
                           betas=(0.9, 0.999),
                           bias_correction=True,
-                          eps=1e-6)
-
+                          eps=1e-6,
+                          set_grad_none=False)
     if args.fp16:
         if args.loss_scale == 0:
             # optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
@@ -357,7 +357,7 @@ def prepare_model_and_optimizer(args, device):
                     master_weights=False if args.accumulate_into_fp16 else True)
         amp._amp_state.loss_scalers[0]._loss_scale = 2**20
 
-    from distributed_optimizers import DistributedOptimizer, DistributedAdasumOptimizer, DistributedCpuAdasumOptimizer
+    from distributed_optimizers import DistributedAdasumOptimizer
     compression = hvd.Compression.fp16 #if args.fp16_allreduce else hvd.Compression.none
     if False: #args.phase2:
         optimizer = DistributedCpuAdasumOptimizer(optimizer, compression=compression)
@@ -401,10 +401,9 @@ def prepare_model_and_optimizer(args, device):
             if distributed_optimizers.local_rank() == 0:
                 print("Broadcasting parameters.")
                 hvd.broadcast_parameters(model.state_dict(), root_rank=0)
-            print("warning:no broadcast",flush=True)
-            #for param in model.parameters():
-            #    handle = distributed_optimizers.local_broadcast_async_(param.data, root = 0)
-            #    handle.wait()
+            for param in model.parameters():
+                handle = distributed_optimizers.local_broadcast_async_(param.data, root = 0)
+                handle.wait()
 
     # If we are starting anew, manually initialize apex states so that bcast optimizer state can pass.
     if not args.resume_from_checkpoint:
@@ -602,7 +601,7 @@ def main():
                     if args.fp16:
                         #with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
                         #is_comm_step = training_steps % args.gradient_accumulation_steps == 0
-                        optimizer.optimizer._prepare_amp_backward()
+                        #optimizer.optimizer._prepare_amp_backward()
                         with amp.scale_loss(loss, optimizer.optimizer,
                                             delay_overflow_check = True,
                                             delay_unscale = True) as scaled_loss: #False if is_comm_step else True
