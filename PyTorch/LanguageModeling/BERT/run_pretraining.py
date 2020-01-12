@@ -84,7 +84,7 @@ def Timer(name):
     end_event.record()
     torch.cuda.synchronize()  # Wait for the events to be recorded!
     elapsed_time_ms = start_event.elapsed_time(end_event)
-    if world_rank() == 0:
+    if distributed_optimizers.world_rank() == 0:
         print("timer:", name, elapsed_time_ms, flush=True)
 
 
@@ -336,28 +336,29 @@ def prepare_model_and_optimizer(args, device):
             optimizer_grouped_parameters.append({'params': [p], 'weight_decay': 0.00, 'name': n})
             names.append({'params': [n], 'weight_decay': 0.00})
 
-    optimizer = BertLAMB(optimizer_grouped_parameters,
-                         lr=args.learning_rate,
-                         warmup=args.warmup_proportion,
-                         t_total=args.max_steps)
-    #optimizer = FusedAdam(optimizer_grouped_parameters,
-    #                      lr=args.learning_rate,
-    #                      betas=(0.9, 0.999),
-    #                      bias_correction=True,
-    #                      eps=1e-6)
+    #optimizer = BertLAMB(optimizer_grouped_parameters,
+    #                     lr=args.learning_rate,
+    #                     warmup=args.warmup_proportion,
+    #                     t_total=args.max_steps)
+    optimizer = FusedAdam(optimizer_grouped_parameters,
+                          lr=args.learning_rate,
+                          betas=(0.9, 0.999),
+                          bias_correction=True,
+                          eps=1e-6,
+                          set_grad_none=False)
 
     if args.fp16:
         if args.loss_scale == 0:
             # optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
             model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale="dynamic", 
-                    master_weights=False if args.accumulate_into_fp16 else True)
+                                              master_weights=False)#False if args.accumulate_into_fp16 else True)
         else:
             # optimizer = FP16_Optimizer(optimizer, static_loss_scale=args.loss_scale)
             model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale=args.loss_scale,
                     master_weights=False if args.accumulate_into_fp16 else True)
         amp._amp_state.loss_scalers[0]._loss_scale = 2**20
 
-    from distributed_optimizers import DistributedOptimizer, DistributedAdasumOptimizer, DistributedCpuAdasumOptimizer
+    from distributed_optimizers import DistributedAdasumOptimizer
     compression = hvd.Compression.fp16 #if args.fp16_allreduce else hvd.Compression.none
     if False: #args.phase2:
         optimizer = DistributedCpuAdasumOptimizer(optimizer, compression=compression)
@@ -400,7 +401,7 @@ def prepare_model_and_optimizer(args, device):
         if not args.resume_from_checkpoint:
             if distributed_optimizers.local_rank() == 0:
                 print("Broadcasting parameters.")
-                hvd.broadcast_parameters(model.state_dict(), root_rank=0)    
+                hvd.broadcast_parameters(model.state_dict(), root_rank=0)
             for param in model.parameters():
                 handle = distributed_optimizers.local_broadcast_async_(param.data, root = 0)
                 handle.wait()
@@ -465,11 +466,11 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step, devic
             param.grad = None
     else:
         # toddm: only for fusedadam
-        #from optimization import warmup_poly, warmup_linear
-        #warmup = warmup_linear
-        #tmp = warmup(global_step / args.max_steps, args.warmup_proportion)
-        #for group in optimizer.optimizer.param_groups:
-        #    group['lr'] = args.learning_rate * tmp
+        from optimization import warmup_poly, warmup_linear
+        warmup = warmup_linear
+        tmp = warmup(global_step / args.max_steps, args.warmup_proportion)
+        for group in optimizer.optimizer.param_groups:
+            group['lr'] = args.learning_rate * tmp
         # toddm end
 
         optimizer.step() # zero's grad, too
@@ -514,7 +515,6 @@ def main():
 
         model.train()
         most_recent_ckpts_paths = []
-        average_loss = 0.0  # averaged loss every args.log_freq steps
         epoch = 0
         training_steps = 0
 
@@ -598,51 +598,32 @@ def main():
                             # this division was merged into predivision
                             loss = loss / args.gradient_accumulation_steps
                             divisor = 1.0
+
+                    is_comm_step = training_steps % args.gradient_accumulation_steps == 0                            
                     if args.fp16:
-                        #with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
-                        is_comm_step = training_steps % args.gradient_accumulation_steps == 0
-                        with amp.scale_loss(loss, optimizer.optimizer,
-                                            delay_overflow_check = True,
-                                            delay_unscale = False if is_comm_step else True) as scaled_loss:
+                        with amp.scale_loss(loss, optimizer.optimizer, delay_overflow_check = True, delay_unscale = True) as scaled_loss:
                             #with Timer("backward"):
                             scaled_loss.backward()
-                            if is_comm_step:# and not args.phase2:
-                                optimizer.synchronize()
+                        if amp._amp_state.opt_properties.patch_torch_functions:
+                            amp._amp_state.handle._clear_cache()
                     else:
                          loss.backward()
-                    average_loss += loss.item()
 
-                    if training_steps % args.gradient_accumulation_steps == 0:
-                        #step_st = time.time()
+                    if is_comm_step:
+                        #with Timer("step"):
+                        t0 = time.time()
                         global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step, device)
+                        t1 = time.time()
                         
                         if (global_step - 1) % args.log_freq == 0:
                             if is_main_process():
+                                step_loss = loss.item() * args.gradient_accumulation_steps
                                 amlrun.log('lr', optimizer.optimizer.param_groups[0]['lr'])
-                                amlrun.log('train_loss', average_loss / args.log_freq)
+                                amlrun.log('train_loss', step_loss)
                                 amlrun.log('throughput', (time.time() - batch_start) / args.log_freq)
-                                print("XXX", global_step, average_loss / args.log_freq, flush=True)
-                            average_loss = 0
+                                print("XXX", global_step, step_loss, t1-t0, flush=True)
                             batch_start = time.time()
                             
-                    if global_step >= args.max_steps:
-                        last_num_steps = int(training_steps / args.gradient_accumulation_steps) % args.log_freq
-                        last_num_steps = args.log_freq if last_num_steps == 0 else last_num_steps
-                        average_loss = torch.tensor(average_loss, dtype=torch.float32).to(device)
-                        average_loss = average_loss / (last_num_steps * divisor)
-                        #average_loss /= distributed_optimizers.world_size()
-                        #hvd.allreduce_(average_loss)
-                        if is_main_process():
-                            print("Total Steps:{} Final Loss = {}".format(training_steps / args.gradient_accumulation_steps, average_loss.item()))
-
-                    elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
-                        if False:#is_main_process():
-                            print("Step:{} Average Loss = {} Step Loss = {} LR {}".format(global_step, average_loss / (
-                                        args.log_freq * divisor),
-                                                                                            loss.item() * args.gradient_accumulation_steps / divisor,
-                                                                                            optimizer.optimizer.param_groups[0][
-                                                                                                'lr']), flush=True)
-
                     if global_step >= args.max_steps or training_steps % (
                             args.num_steps_per_checkpoint * args.gradient_accumulation_steps) == 0:
                         if is_main_process():
