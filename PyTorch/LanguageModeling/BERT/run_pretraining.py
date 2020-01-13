@@ -579,6 +579,9 @@ def main():
 
                 dataset_future = pool.submit(create_pretraining_dataset, data_file, args.max_predictions_per_seq, shared_file_list, args)
 
+                cpu_buffer = torch.zeros(1,dtype=torch.float32,device='cpu',requires_grad=False).pin_memory()
+                average_loss = 0
+                
                 #train_iter = tqdm(train_dataloader, desc="Iteration") if is_main_process() else train_dataloader
                 train_iter = train_dataloader
                 batch_start = time.time()                
@@ -588,7 +591,8 @@ def main():
                     input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
                     loss = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask,
                                     masked_lm_labels=masked_lm_labels, next_sentence_label=next_sentence_labels,
-                                    checkpoint_activations=args.checkpoint_activations)
+                                    checkpoint_activations=args.checkpoint_activations)                                        
+                    
                     if args.n_gpu > 1:
                         loss = loss.mean()  # mean() to average on multi-gpu.
 
@@ -599,6 +603,7 @@ def main():
                             loss = loss / args.gradient_accumulation_steps
                             divisor = 1.0
 
+                    cpu_buffer.copy_(loss.data, non_blocking=True)
                     is_comm_step = training_steps % args.gradient_accumulation_steps == 0                            
                     if args.fp16:
                         with amp.scale_loss(loss, optimizer.optimizer, delay_overflow_check = True, delay_unscale = True) as scaled_loss:
@@ -608,22 +613,28 @@ def main():
                             amp._amp_state.handle._clear_cache()
                     else:
                          loss.backward()
-
+                    
                     if is_comm_step:
                         #with Timer("step"):
                         t0 = time.time()
                         global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step, device)
                         t1 = time.time()
+
+                        torch.cuda.synchronize()
+                        average_loss += cpu_buffer.item()
                         
                         if (global_step - 1) % args.log_freq == 0:
                             if is_main_process():
-                                step_loss = loss.item() * args.gradient_accumulation_steps
                                 amlrun.log('lr', optimizer.optimizer.param_groups[0]['lr'])
-                                amlrun.log('train_loss', step_loss)
+                                amlrun.log('train_loss', average_loss)
                                 amlrun.log('throughput', (time.time() - batch_start) / args.log_freq)
-                                print("XXX", global_step, step_loss, t1-t0, flush=True)
+                                print("XXX", global_step, average_loss, t1-t0, flush=True)
                             batch_start = time.time()
-                            
+                        average_loss = 0
+                    else:
+                        torch.cuda.synchronize()
+                        average_loss += cpu_buffer.item()
+                        
                     if global_step >= args.max_steps or training_steps % (
                             args.num_steps_per_checkpoint * args.gradient_accumulation_steps) == 0:
                         if is_main_process():
