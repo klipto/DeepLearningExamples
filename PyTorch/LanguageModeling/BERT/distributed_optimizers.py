@@ -178,8 +178,8 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
     def _allreduce_grad_async(self, param_index, scalar, group, p, start, master):        
         owner = param_index % num_devices
         handle = local_reduce_sum_async_(p.grad, owner)
-        #if local_rank() == owner:
-        #    master.data.copy_(p.data, non_blocking = True)            
+        if local_rank() == owner:
+            master.data.copy_(p.data, non_blocking = True)            
         return handle, (p, param_index, scalar, start, group, master)
 
     def _clip_global_norm_(self, total_norm_sq):
@@ -216,29 +216,23 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 
         t1 = time.time()
         local_allreduce_sum_(total_norm_sq)
-        local_allreduce_sum_(amp_scale._overflow_buf)
-        #tmp = torch.isfinite(total_norm_sq)
-        #self.cpu_buffer.copy_(tmp, non_blocking=True)
         t2 = time.time()
-
-        self._clip_global_norm_(total_norm_sq)
+        had_overflow = not (torch.isfinite(total_norm_sq).item())
         t3 = time.time()
         
         # grad clip & step        
-        tmp = self.optimizer.param_groups
-        self.optimizer.param_groups = my_param_groups
-
-        t4 = time.time()
-        #had_overflow = not (torch.isfinite(total_norm_sq).item())
-        #torch.cuda.synchronize()
-        #had_overflow = not (self.cpu_buffer.item())
-        had_overflow = amp_scale._overflow_buf.item() > 0
-        t5 = time.time()
-        
-        if had_overflow == False:
-            #torch.cuda.synchronize()
+        if had_overflow == False:            
+            self._clip_global_norm_(total_norm_sq)
+	    t4 = time.time()
+            tmp = self.optimizer.param_groups
+            self.optimizer.param_groups = my_param_groups
+            
             self.optimizer.step()
-        self.optimizer.param_groups = tmp
+            t5 = time.time()
+            self.optimizer.param_groups = tmp
+        else:
+            t4 = time.time()
+            t5 = time.time()
 
         # start adasum
         t6 = time.time()
@@ -264,6 +258,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         local_broadcast_handles = []            
         for _, (p, param_index, scalar, start, group, master) in reversed(self._handles):
             owner = param_index % num_devices
+
             if local_rank() == owner:
                 self.overflow_buf.zero_()
                 hvd.synchronize(hvd_handles[param_index])                
@@ -279,7 +274,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                           scalar.loss_scale, flush=True)
                 scalar.update_scale(layer_had_overflow == 1)
                 local_broadcast_handles.append(local_broadcast_async_(p.data, root=owner))
-                master.data.copy_(p.data, non_blocking=True)
+                #master.data.copy_(p.data, non_blocking=True)
             else:
                 local_broadcast_handles.append(local_broadcast_async_(p.data, root=owner))
         t8 = time.time()
