@@ -229,8 +229,8 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
 
         t4 = time.time()
         #had_overflow = not (torch.isfinite(total_norm_sq).item())
-        torch.cuda.synchronize()
-        had_overflow = self.cpu_buffer.item()
+        #torch.cuda.synchronize()
+        had_overflow = not (self.cpu_buffer.item())
         t5 = time.time()
         
         if had_overflow == False:
