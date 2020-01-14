@@ -621,8 +621,8 @@ def main():
                         #t1 = time.time()
 
                         #t3 = time.time()
-                        #torch.cuda.synchronize()
-                        #average_loss += cpu_buffer.item()
+                        torch.cuda.synchronize()
+                        average_loss += cpu_buffer.item()
                         #t4 = time.time()
                         
                         if (global_step - 1) % args.log_freq == 0:
@@ -633,10 +633,10 @@ def main():
                                 print("XXX", global_step, average_loss, (time.time() - batch_start) / args.log_freq, flush=True)
                             batch_start = time.time()
                         average_loss = 0.0
-                    #else:
-                    #    torch.cuda.synchronize()
-                    #    average_loss += cpu_buffer.item()
-                        
+                    else:
+                        torch.cuda.synchronize()
+                        average_loss += cpu_buffer.item()
+                    
                     if global_step >= args.max_steps or training_steps % (
                             args.num_steps_per_checkpoint * args.gradient_accumulation_steps) == 0:
                         if is_main_process():

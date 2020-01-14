@@ -216,8 +216,9 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 
         t1 = time.time()
         local_allreduce_sum_(total_norm_sq)
-        tmp = torch.isfinite(total_norm_sq)
-        self.cpu_buffer.copy_(tmp, non_blocking=True)
+        local_allreduce_sum_(amp_scale._overflow_buf)
+        #tmp = torch.isfinite(total_norm_sq)
+        #self.cpu_buffer.copy_(tmp, non_blocking=True)
         t2 = time.time()
 
         self._clip_global_norm_(total_norm_sq)
@@ -229,8 +230,9 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
 
         t4 = time.time()
         #had_overflow = not (torch.isfinite(total_norm_sq).item())
-        torch.cuda.synchronize()
-        had_overflow = not (self.cpu_buffer.item())
+        #torch.cuda.synchronize()
+        #had_overflow = not (self.cpu_buffer.item())
+        had_overflow = amp_scale._overflow_buf.item() > 0
         t5 = time.time()
         
         if had_overflow == False:
