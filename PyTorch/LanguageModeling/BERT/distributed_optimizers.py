@@ -220,7 +220,9 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         had_overflow = not (torch.isfinite(total_norm_sq).item())
         t3 = time.time()
         
-        # grad clip & step        
+        # grad clip & step
+        t4 = t3
+        t5 = t3
         if had_overflow == False:            
             self._clip_global_norm_(total_norm_sq)
 	    t4 = time.time()
@@ -230,9 +232,6 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
             self.optimizer.step()
             t5 = time.time()
             self.optimizer.param_groups = tmp
-        else:
-            t4 = time.time()
-            t5 = time.time()
 
         # start adasum
         t6 = time.time()
