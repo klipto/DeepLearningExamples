@@ -519,7 +519,9 @@ def main():
         training_steps = 0
 
         pool = ProcessPoolExecutor(1)
-
+        average_loss = 0.0
+        cpu_buffer = torch.zeros(1,dtype=torch.float32,device='cpu',requires_grad=False).pin_memory()
+        
         # Note: We loop infinitely over epochs, termination is handled via iteration count
         while True:
             thread = None
@@ -577,10 +579,7 @@ def main():
                 data_file=args.input_dir + file_name
                 previous_file = data_file
 
-                dataset_future = pool.submit(create_pretraining_dataset, data_file, args.max_predictions_per_seq, shared_file_list, args)
-
-                cpu_buffer = torch.zeros(1,dtype=torch.float32,device='cpu',requires_grad=False).pin_memory()
-                average_loss = 0
+                dataset_future = pool.submit(create_pretraining_dataset, data_file, args.max_predictions_per_seq, shared_file_list, args)                
                 
                 #train_iter = tqdm(train_dataloader, desc="Iteration") if is_main_process() else train_dataloader
                 train_iter = train_dataloader
@@ -609,6 +608,7 @@ def main():
                         with amp.scale_loss(loss, optimizer.optimizer, delay_overflow_check = True, delay_unscale = True) as scaled_loss:
                             #with Timer("backward"):
                             scaled_loss.backward()
+                            #t5 = time.time()
                         if amp._amp_state.opt_properties.patch_torch_functions:
                             amp._amp_state.handle._clear_cache()
                     else:
@@ -616,24 +616,26 @@ def main():
                     
                     if is_comm_step:
                         #with Timer("step"):
-                        t0 = time.time()
+                        #t0 = time.time()
                         global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step, device)
-                        t1 = time.time()
+                        #t1 = time.time()
 
-                        torch.cuda.synchronize()
-                        average_loss += cpu_buffer.item()
+                        #t3 = time.time()
+                        #torch.cuda.synchronize()
+                        #average_loss += cpu_buffer.item()
+                        #t4 = time.time()
                         
                         if (global_step - 1) % args.log_freq == 0:
                             if is_main_process():
                                 amlrun.log('lr', optimizer.optimizer.param_groups[0]['lr'])
                                 amlrun.log('train_loss', average_loss)
                                 amlrun.log('throughput', (time.time() - batch_start) / args.log_freq)
-                                print("XXX", global_step, average_loss, t1-t0, flush=True)
+                                print("XXX", global_step, average_loss, (time.time() - batch_start) / args.log_freq, flush=True)
                             batch_start = time.time()
-                        average_loss = 0
-                    else:
-                        torch.cuda.synchronize()
-                        average_loss += cpu_buffer.item()
+                        average_loss = 0.0
+                    #else:
+                    #    torch.cuda.synchronize()
+                    #    average_loss += cpu_buffer.item()
                         
                     if global_step >= args.max_steps or training_steps % (
                             args.num_steps_per_checkpoint * args.gradient_accumulation_steps) == 0:
