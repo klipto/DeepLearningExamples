@@ -212,7 +212,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 group['params'] = [master]
                 my_param_groups.append(group)
                 total_norm_sq += master.grad.norm() ** 2
-                master.data.copy_(p.data)
+                #master.data.copy_(p.data)
                 
         t1 = time.time()
         local_allreduce_sum_(total_norm_sq)
@@ -277,6 +277,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                           scalar.loss_scale, flush=True)
                 scalar.update_scale(layer_had_overflow == 1)
                 local_broadcast_handles.append(local_broadcast_async_(p.data, root=owner))
+                master.data.copy_(p.data, non_blocking=True)
             else:
                 local_broadcast_handles.append(local_broadcast_async_(p.data, root=owner))
         t8 = time.time()
