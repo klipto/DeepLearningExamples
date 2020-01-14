@@ -214,13 +214,15 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 #master.data.copy_(p.data)
                 
         t1 = time.time()
-        local_allreduce_sum_(total_norm_sq)
-        
+        handle = local_allreduce_sum_async_(total_norm_sq)
         t2 = time.time()
+
+        self._clip_global_norm_(total_norm_sq)
+        handle.wait()
         had_overflow = not (torch.isfinite(total_norm_sq).item())
+        
         # grad clip & step
         if had_overflow == False:
-            self._clip_global_norm_(total_norm_sq)
             torch.cuda.synchronize()
             tmp = self.optimizer.param_groups
             self.optimizer.param_groups = my_param_groups
