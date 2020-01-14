@@ -185,7 +185,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
 
         amp_scale = amp._amp_state.loss_scalers[0]
         scale = 1.0 / (num_devices * amp_scale.loss_scale())
-        ssq = ((p.grad.data).norm(p=None, dtype=torch.float32) ** 2) * (scale**2)
+        ssq = ((p.grad.data).norm(p=None, dtype=torch.float64) ** 2) * (scale**2)
         self.total_norm_sq += ssq
         
         owner = param_index % num_devices        
@@ -195,15 +195,6 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 master.data.copy_(p.data)
         return handle, (p, param_index, scalar, start, group, master)
 
-    def _clip_global_norm_(self, total_norm_sq):
-        clip_coef = 1.0 / (torch.sqrt(total_norm_sq) + 1e-6)
-        clip_coef = torch.min(clip_coef, self.one)
-        
-        for handle, (p, param_index, scalar, start, group, master) in self._handles:
-            owner = param_index % num_devices
-            if local_rank() == owner:
-                master.grad.data.mul_(clip_coef)                
-                
     def step(self, closure=None):
         loss = None
         if closure is not None:
@@ -214,12 +205,13 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
 
         local_allreduce_sum_(self.total_norm_sq)
         self.cpu_buffer.copy_(self.total_norm_sq, non_blocking=True)
-        
-        clip_coef = 1.0 / (torch.sqrt(self.total_norm_sq) + 1e-6)
+
+        clip_coef = 1.0 / (torch.sqrt(self.total_norm_sq.to(torch.float32)) + 1e-6)
         clip_coef = torch.min(clip_coef, self.one)
         
         my_param_groups = []
         scale = 1.0 / (num_devices * amp_scale.loss_scale())
+        self.overflow_buf.zero_()
         for handle, (p, param_index, scalar, start, group, master) in reversed(self._handles):
             owner = param_index % num_devices
             if local_rank() == owner:
@@ -233,15 +225,12 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
             else:
                 handle.wait()
 
-        #torch.cuda.current_stream().synchronize()        
-        #had_overflow = not (math.isfinite(self.cpu_buffer.item()))
-        #self._clip_global_norm_(self.total_norm_sq)        
-
+        had_overflow0 = not torch.isfinite(self.overflow_buf).item()
+        assert had_overflow == had_overflow0
+        
         tmp = self.optimizer.param_groups
         self.optimizer.param_groups = my_param_groups
-        if had_overflow == False:
-            self.optimizer.step()
-
+        if had_overflow == False: self.optimizer.step()
         self.optimizer.param_groups = tmp
 
         # start adasum
