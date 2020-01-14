@@ -178,8 +178,8 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
     def _allreduce_grad_async(self, param_index, scalar, group, p, start, master):        
         owner = param_index % num_devices
         handle = local_reduce_sum_async_(p.grad, owner)
-        if local_rank() == owner:
-            master.data.copy_(p.data, non_blocking = True)            
+        #if local_rank() == owner:
+        #    master.data.copy_(p.data, non_blocking = True)            
         return handle, (p, param_index, scalar, start, group, master)
 
     def _clip_global_norm_(self, total_norm_sq):
@@ -212,7 +212,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 group['params'] = [master]
                 my_param_groups.append(group)
                 total_norm_sq += master.grad.norm() ** 2
-                #master.data.copy_(p.data)
+                master.data.copy_(p.data)
                 
         t1 = time.time()
         local_allreduce_sum_(total_norm_sq)
@@ -229,12 +229,12 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
 
         t4 = time.time()
         #had_overflow = not (torch.isfinite(total_norm_sq).item())
-        #torch.cuda.synchronize()
+        torch.cuda.synchronize()
         had_overflow = not (self.cpu_buffer.item())
         t5 = time.time()
         
         if had_overflow == False:
-            torch.cuda.synchronize()
+            #torch.cuda.synchronize()
             self.optimizer.step()
         self.optimizer.param_groups = tmp
 
