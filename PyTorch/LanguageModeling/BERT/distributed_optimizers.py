@@ -127,7 +127,8 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         self._requires_update = []
         self._synchronized = False
         self._should_synchronize = True
-        
+
+        self.cpu_buffer = torch.zeros(1,dtype=torch.bool,device='cpu',requires_grad=False).pin_memory()
         self._buffer = torch.cuda.FloatTensor([0.0, 0.0])
         self.one = torch.cuda.FloatTensor([1.0])
         self.overflow_buf = torch.cuda.IntTensor([0])
@@ -214,7 +215,9 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 #master.data.copy_(p.data)
                 
         t1 = time.time()
-        handle = local_allreduce_sum_async_(total_norm_sq)
+        local_allreduce_sum_(total_norm_sq)
+        tmp = torch.isfinite(total_norm_sq)
+        self.cpu_buffer.copy_(tmp, non_blocking=True)
         t2 = time.time()
 
         self._clip_global_norm_(total_norm_sq)
@@ -223,11 +226,13 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         # grad clip & step        
         tmp = self.optimizer.param_groups
         self.optimizer.param_groups = my_param_groups
-        
-        handle.wait()
+
         t4 = time.time()
-        had_overflow = not (torch.isfinite(total_norm_sq).item())
+        #had_overflow = not (torch.isfinite(total_norm_sq).item())
+        torch.cuda.synchronize()
+        had_overflow = self.cpu_buffer.item()
         t5 = time.time()
+        
         if had_overflow == False:
             torch.cuda.synchronize()
             self.optimizer.step()
