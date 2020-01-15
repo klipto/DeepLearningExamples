@@ -346,7 +346,7 @@ def prepare_model_and_optimizer(args, device):
                           betas=(0.9, 0.999),
                           bias_correction=True,
                           eps=1e-6,
-                          set_grad_none=True)
+                          set_grad_none=False)
 
     if args.fp16:
         if args.loss_scale == 0:
