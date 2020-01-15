@@ -241,7 +241,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         amp_scale = amp._amp_state.loss_scalers[0]
         scale = 1.0 / (num_devices * amp_scale.loss_scale())
         scale_sq = scale**2
-        normsq = 0.0        
+        normsq = torch.cuda.DoubleTensor([0.0])
         my_param_groups = []
         fp16_grads = []
         fp32_grads = []
