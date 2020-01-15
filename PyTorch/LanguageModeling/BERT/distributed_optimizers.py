@@ -39,8 +39,8 @@ def local_allreduce_sum_async_(tensor, root=0):
 
 def local_allreduce_sum_(tensor, root=0):
     handle = torch.distributed.all_reduce(tensor, async_op=False)
-
     return handle
+
 def local_allreduce_max_(tensor, root=0):
     handle = torch.distributed.all_reduce(tensor, op = torch.distributed.ReduceOp.MAX, async_op=False)
     return handle
@@ -183,14 +183,17 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
     
     def _allreduce_grad_async(self, param_index, scalar, group, p, start, master):
 
-        amp_scale = amp._amp_state.loss_scalers[0]
-        scale = 1.0 / (num_devices * amp_scale.loss_scale())
-        ssq = ((p.grad.data).norm(p=None, dtype=torch.float64) ** 2) * (scale**2)
-        self.total_norm_sq += ssq
-        
         owner = param_index % num_devices        
-        handle = local_reduce_sum_async_(p.grad, owner)
+        #handle = local_reduce_sum_async_(p.grad, owner)
+        handle = local_reduce_sum_(p.grad, owner)
         if local_rank() == owner:
+            amp_scale = amp._amp_state.loss_scalers[0]
+            scale = 1.0 / (num_devices * amp_scale.loss_scale())
+            ssq = p.grad.data.norm(p=2, dtype=torch.float64) ** 2 * (scale**2)
+            # #ssq = (scale * p.grad.data).norm(p=2, dtype=torch.float64) ** 2
+            # ssq = (p.grad.data.to(torch.float32)*scale).norm(p=2)**2
+            self.total_norm_sq += ssq
+            
             if self._is_first:
                 master.data.copy_(p.data)
         return handle, (p, param_index, scalar, start, group, master)
@@ -202,32 +205,47 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
 
         # finish backward
         amp_scale = amp._amp_state.loss_scalers[0]
-
-        local_allreduce_sum_(self.total_norm_sq)
-        self.cpu_buffer.copy_(self.total_norm_sq, non_blocking=True)
-
-        clip_coef = 1.0 / (torch.sqrt(self.total_norm_sq.to(torch.float32)) + 1e-6)
-        clip_coef = torch.min(clip_coef, self.one)
-        
-        my_param_groups = []
         scale = 1.0 / (num_devices * amp_scale.loss_scale())
-        self.overflow_buf.zero_()
+        local_allreduce_sum_(self.total_norm_sq)
+        had_overflow = not torch.isfinite(self.total_norm_sq).item()
+        #self.cpu_buffer.copy_(self.total_norm_sq, non_blocking=True)
+
+        #clip_coef = 1.0 / (torch.sqrt(self.total_norm_sq.to(torch.float32)) + 1e-6)
+        #clip_coef = torch.min(clip_coef, self.one)
+        
+        normsq = 0.0        
+        my_param_groups = []
+        
         for handle, (p, param_index, scalar, start, group, master) in reversed(self._handles):
             owner = param_index % num_devices
             if local_rank() == owner:
                 group['params'] = [master]
                 my_param_groups.append(group)
-                handle.wait()
+                #handle.wait()
                 amp_C.multi_tensor_scale(65536,
-                                         self.overflow_buf,
+                                         amp_scale._overflow_buf,
                                          [[p.grad], [master.grad]],
-                                         scale * clip_coef)
+                                         scale)#scale * clip_coef)
+                #normsq += master.grad.data.norm(p=2, dtype=torch.float32)**2
             else:
-                handle.wait()
+                pass #handle.wait()
 
-        had_overflow0 = not torch.isfinite(self.overflow_buf).item()
-        assert had_overflow == had_overflow0
+        #local_allreduce_sum_(normsq)
+        #local_allreduce_max_(amp_scale._overflow_buf)
+        #torch.cuda.synchronize()
+        #had_overflow = amp_scale._overflow_buf.item() > 0
+        #had_overflow = not torch.isfinite(normsq).item()
         
+        #print('RRR', scale, scale*clip_coef, self.total_norm_sq.item(), normsq.item(), had_overflow, flush=True)
+        #for handle, (p, param_index, scalar, start, group, master) in reversed(self._handles):
+        #    owner = param_index % num_devices
+        #    if local_rank() == owner:
+        #        master.grad.data.mul_(clip_coef)
+                
+        #torch.cuda.synchronize()
+        #had_overflow = not math.isfinite(self.cpu_buffer.item())
+        #if had_overflow:
+        #    assert not torch.isfinite(self.overflow_buf).item()
         tmp = self.optimizer.param_groups
         self.optimizer.param_groups = my_param_groups
         if had_overflow == False: self.optimizer.step()

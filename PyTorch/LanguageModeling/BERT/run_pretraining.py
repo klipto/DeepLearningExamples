@@ -602,7 +602,7 @@ def main():
                             loss = loss / args.gradient_accumulation_steps
                             divisor = 1.0
 
-                    #cpu_buffer.copy_(loss.data, non_blocking=True)
+                    cpu_buffer.copy_(loss.data, non_blocking=True)
                     is_comm_step = training_steps % args.gradient_accumulation_steps == 0                            
                     if args.fp16:
                         with amp.scale_loss(loss, optimizer.optimizer, delay_overflow_check = True, delay_unscale = True) as scaled_loss:
@@ -621,21 +621,21 @@ def main():
                         #t1 = time.time()
 
                         #t3 = time.time()
-                        #torch.cuda.synchronize()
-                        #average_loss += cpu_buffer.item()
+                        torch.cuda.synchronize()
+                        average_loss += cpu_buffer.item()
                         #t4 = time.time()
                         
                         if global_step % args.log_freq == 0:
                             if is_main_process():
                                 amlrun.log('lr', optimizer.optimizer.param_groups[0]['lr'])
-                                #amlrun.log('train_loss', average_loss / args.log_freq)
+                                amlrun.log('train_loss', average_loss / args.log_freq)
                                 amlrun.log('throughput', (time.time() - batch_start) / args.log_freq)
                                 print("XXX", global_step, average_loss / args.log_freq, (time.time() - batch_start) / args.log_freq, flush=True)
                             batch_start = time.time()
                             average_loss = 0.0
-                    #else:
-                    #    torch.cuda.synchronize()
-                    #    average_loss += cpu_buffer.item()
+                    else:
+                        torch.cuda.synchronize()
+                        average_loss += cpu_buffer.item()
                     
                     if global_step >= args.max_steps or training_steps % (
                             args.num_steps_per_checkpoint * args.gradient_accumulation_steps) == 0:
