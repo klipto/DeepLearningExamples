@@ -149,12 +149,13 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         self._synchronized = False
         self._should_synchronize = True
 
-        self.total_norm_sq = torch.cuda.DoubleTensor([0.0])
+        #self.total_norm_sq = torch.cuda.DoubleTensor([0.0])
         
         self.cpu_buffer = torch.zeros(1,dtype=torch.float32,device='cpu',requires_grad=False).pin_memory()
         self._buffer = torch.cuda.FloatTensor([0.0, 0.0])
         self.one = torch.cuda.FloatTensor([1.0])
         self.overflow_buf = torch.cuda.IntTensor([0])
+        self.total_norm_sq = torch.cuda.DoubleTensor([0.0])
         self._is_first = True
 
         total = 0
@@ -224,11 +225,16 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
 
     
     def _allreduce_grad_async(self, param_index, scalar, group, p, start, master):
+        ssq = p.grad.data.norm(p=2, dtype=torch.float64) ** 2
+        self.total_norm_sq += ssq
+
         owner = self.owner[param_index]
         handle = local_reduce_sum_async_(p.grad, owner)
+
         if local_rank() == owner:
             if self._is_first:
                 master.data.copy_(p.data)
+                
         return handle, (p, param_index, scalar, start, group, master)
 
     def step(self, closure=None):
@@ -239,13 +245,18 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
         # finish backward
         #with Timer('finish'):
         amp_scale = amp._amp_state.loss_scalers[0]
-        scale = 1.0 / (num_devices * amp_scale.loss_scale())
-        scale_sq = scale**2
-        normsq = torch.cuda.DoubleTensor([0.0])
+        scale = 1.0 / (num_devices * amp_scale.loss_scale())#torch.cuda.DoubleTensor([1.0 / (num_devices * amp_scale.loss_scale())])
+        #scale_sq = scale**2
+        #normsq = torch.cuda.DoubleTensor([0.0])
+        #normsq = torch.cuda.FloatTensor([0.0])
         my_param_groups = []
         fp16_grads = []
         fp32_grads = []
 
+        self.total_norm_sq *= (scale ** 2)
+        local_allreduce_sum_(self.total_norm_sq)
+        had_overflow = not torch.isfinite(self.total_norm_sq).item()
+        
         for handle, (p, param_index, scalar, start, group, master) in reversed(self._handles):
             owner = self.owner[param_index]
             if local_rank() == owner:
@@ -254,22 +265,37 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 fp16_grads.append(p.grad)
                 fp32_grads.append(master.grad)
                 handle.wait()
-                ssq = p.grad.data.norm(p=2, dtype=torch.float64) ** 2 * scale_sq
-                normsq += ssq
+                #amp_C.multi_tensor_scale(65536,
+                #                         amp_scale._overflow_buf,
+                #                        [[p.grad], [master.grad]],
+                #                         1.0 / (num_devices * amp_scale.loss_scale()))
+                #normsq += master.grad.norm(p=2)**2
+                #ssq = p.grad.data.norm(p=2, dtype=torch.float64) ** 2 * scale_sq
+
+                #p.grad.data.mul_(scale)
+                #ssq = p.grad.data.norm(p=2, dtype=torch.float64) ** 2
+                #normsq += ssq
             else:
                 handle.wait()
 
         #with Timer('comm_scale'):
-        local_allreduce_sum_(normsq)
-        had_overflow = not torch.isfinite(normsq).item()
-        clip_coef = 1.0 / (torch.sqrt(normsq).to(torch.float32) + 1e-6)
+        #local_allreduce_sum_(normsq)
+        #py_normsq = normsq.item()
+        #had_overflow = not torch.isfinite(normsq).item()
+        #had_overflow = not math.isfinite(py_normsq)
+
+        #clip_coef = 1.0 / (torch.sqrt(self.total_norm_sq).to(torch.float32) + 1e-6)
+        clip_coef = 1.0 / ((torch.sqrt(self.total_norm_sq).to(torch.float32) + 1e-6) * num_devices * amp_scale.loss_scale())
+        self.total_norm_sq.zero_()
         clip_coef = torch.min(clip_coef, self.one)
             
         #with Timer('scale'):
         amp_C.multi_tensor_scale(65536,
                                  amp_scale._overflow_buf,
+                                 #[fp32_grads, fp32_grads],
+                                 #clip_coef)
                                  [fp16_grads, fp32_grads],
-                                 clip_coef * scale)
+                                 clip_coef)
 
         #with Timer("adam_step"):
         tmp = self.optimizer.param_groups
@@ -285,7 +311,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
             handle = None
             if local_rank() == owner:                    
                 if had_overflow == False:
-                    master.data.sub_(p.data)
+                    master.data.sub_(p.data)#, out=p.grad.data)
                     torch.mul(master.data, scalar.loss_scale, out=p.grad.data)
                 else:
                     p.grad.data.zero_()
@@ -295,46 +321,91 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
 
         # finish adasum
         #with Timer("finish_adasum"):        
-        local_broadcast_handles = []
+        #local_broadcast_handles = []
+        fp16_grads = []
+        fp32_masters = []
         for _, (p, param_index, scalar, start, group, master) in self._handles:
             owner = self.owner[param_index]
             self._allreduce_delay[param_index] = self.backward_passes_per_step
             if local_rank() == owner:
                 group['params'] = [p]                    
-                self.overflow_buf.zero_()
-                hvd.synchronize(hvd_handles[param_index])                
-                amp_C.multi_tensor_scale(65536,
-                                        self.overflow_buf,
-                                        [[p.grad], [master]],
-                                        1.0 / scalar.loss_scale)
-                layer_had_overflow = self.overflow_buf.item()
-                #torch.add(input=p.data, other=p.grad, alpha=1/scalar.loss_scale, out=p.data)
-                if layer_had_overflow == 0:
-                    p.data.add_(master)
-                else:
-                    print("Layer overflow", world_rank(), param_index,
-                          scalar.loss_scale, flush=True)
-                scalar.update_scale(layer_had_overflow == 1)
-                local_broadcast_handles.append(local_broadcast_async_(p.data, root=owner))
-                master.data.copy_(p.data, non_blocking=True)                    
-            else:
-                local_broadcast_handles.append(local_broadcast_async_(p.data, root=owner))
+                #self.overflow_buf.zero_()
 
+                fp16_grads.append(p.grad)
+                fp32_masters.append(master)
+                
+                hvd.synchronize(hvd_handles[param_index])
+                #amp_C.multi_tensor_scale(65536,
+                #                        self.overflow_buf,
+                #                        [[p.grad], [master]],
+                #                        1.0 / scalar.loss_scale)
+                #layer_had_overflow = self.overflow_buf.item()
+                #torch.add(input=p.data, other=p.grad, alpha=1/scalar.loss_scale, out=p.data)
+                #if layer_had_overflow == 0:
+                #    p.data.add_(master)
+                #else:
+                #    print("Layer overflow", world_rank(), param_index,
+                #          scalar.loss_scale, flush=True)
+                #scalar.update_scale(layer_had_overflow == 1)
+                #local_broadcast_handles.append(local_broadcast_async_(p.data, root=owner))
+                #master.data.copy_(p.data, non_blocking=True)                    
+            #else:
+            #    local_broadcast_handles.append(local_broadcast_async_(p.data, root=owner))
+
+        scalar = self._handles[0][1][2]
+        self.overflow_buf.zero_()
+        amp_C.multi_tensor_scale(65536,
+                                 self.overflow_buf,
+                                 [fp16_grads, fp32_masters],
+                                 1.0 / scalar.loss_scale)
+
+        #layer_had_overflow = self.overflow_buf.item()
+        #tmp = 1.0 - self.overflow_buf
+        self.cpu_buffer.copy_(self.overflow_buf, non_blocking=True)
+        for _, (p, param_index, scalar, start, group, master) in self._handles:
+            owner = self.owner[param_index]
+            if local_rank() == owner:
+                #if layer_had_overflow == 0:
+                p.data.add_(master.data)
+                #master.data.copy_(p.data, non_blocking=True)
+                local_broadcast_async_(p.data, root=owner)                
+            else:
+                local_broadcast_async_(p.data, root=owner)
+
+            #local_broadcast_handles.append(local_broadcast_async_(p.data, root=owner))
+                    
         #with Timer("cleanup"):
         amp_scale._has_overflow = had_overflow
         amp_scale.update_scale()        
         if had_overflow:
-            print("Rank {} had overflow: new scale {}".format(
+            print("Rank {} had overflow: new scale {} ".format(
                 world_rank(), amp_scale.loss_scale()), flush=True)
 
         amp_scale.clear_overflow_state()        
         self.optimizer.zero_grad()
         self._is_first = False
-        self.total_norm_sq.zero_()
+        #self.total_norm_sq.zero_()
 
-        for handle in local_broadcast_handles:
-            handle.wait()
+        #for handle in local_broadcast_handles:
+        #    handle.wait()
 
+        torch.cuda.current_stream().synchronize()
+        layer_had_overflow = self.cpu_buffer.item()
+
+        if layer_had_overflow == 1:
+            print("Layer overflow", world_rank(),
+                  scalar.loss_scale, flush=True)
+            for _, (p, param_index, scalar, start, group, master) in self._handles:
+                if local_rank() == owner:
+                    p.data.copy_(master.data)
+        else:
+            for _, (p, param_index, scalar, start, group, master) in self._handles:
+                owner = self.owner[param_index]
+                if local_rank() == owner:
+                    master.data.copy_(p.data, non_blocking=True)
+                            
+        scalar.update_scale(layer_had_overflow == 1)
+        
         return loss
 
 
