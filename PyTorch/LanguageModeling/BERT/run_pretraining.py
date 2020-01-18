@@ -72,20 +72,21 @@ logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message
 logger = logging.getLogger(__name__)
 
 from contextlib import contextmanager
-
 @contextmanager
-def Timer(name):
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
+def Timer(name, log=False):
+    if log:
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
 
     yield None
 
-    end_event.record()
-    torch.cuda.synchronize()  # Wait for the events to be recorded!
-    elapsed_time_ms = start_event.elapsed_time(end_event)
-    if distributed_optimizers.world_rank() == 0:
-        print("timer:", name, elapsed_time_ms, flush=True)
+    if log:
+        end_event.record()
+        torch.cuda.synchronize()  # Wait for the events to be recorded!
+        elapsed_time_ms = start_event.elapsed_time(end_event)
+        if distributed_optimizers.world_rank() == 0:
+            print("timer:", name, elapsed_time_ms, flush=True)
 
 
 def create_pretraining_dataset(input_file, max_pred_length, shared_list, args):
@@ -585,57 +586,62 @@ def main():
                 train_iter = train_dataloader
                 batch_start = time.time()                
                 for step, batch in enumerate(train_iter):
-                    training_steps += 1
-                    batch = [t.to(device) for t in batch]
-                    input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
-                    loss = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask,
-                                    masked_lm_labels=masked_lm_labels, next_sentence_label=next_sentence_labels,
-                                    checkpoint_activations=args.checkpoint_activations)                                        
-                    
-                    if args.n_gpu > 1:
-                        loss = loss.mean()  # mean() to average on multi-gpu.
+                    with Timer('forward'):
+                        training_steps += 1
+                        batch = [t.to(device) for t in batch]
+                        input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
+                        loss = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask,
+                                        masked_lm_labels=masked_lm_labels, next_sentence_label=next_sentence_labels,
+                                        checkpoint_activations=args.checkpoint_activations)                                        
 
-                    divisor = args.gradient_accumulation_steps
-                    if args.gradient_accumulation_steps > 1:
-                        if not args.allreduce_post_accumulation:
-                            # this division was merged into predivision
-                            loss = loss / args.gradient_accumulation_steps
-                            divisor = 1.0
+                    with Timer("backward"):
+                        if args.n_gpu > 1:
+                            loss = loss.mean()  # mean() to average on multi-gpu.
 
-                    cpu_buffer.copy_(loss.data, non_blocking=True)
-                    is_comm_step = training_steps % args.gradient_accumulation_steps == 0                            
-                    if args.fp16:
-                        with amp.scale_loss(loss, optimizer.optimizer, delay_overflow_check = True, delay_unscale = True) as scaled_loss:
-                            #with Timer("backward"):
-                            scaled_loss.backward()
-                            #t5 = time.time()
-                        if amp._amp_state.opt_properties.patch_torch_functions:
-                            amp._amp_state.handle._clear_cache()
-                    else:
-                         loss.backward()
+                        divisor = args.gradient_accumulation_steps
+                        if args.gradient_accumulation_steps > 1:
+                            if not args.allreduce_post_accumulation:
+                                # this division was merged into predivision
+                                loss = loss / args.gradient_accumulation_steps
+                                divisor = 1.0
+
+                        cpu_buffer.copy_(loss.data, non_blocking=True)
+                        is_comm_step = training_steps % args.gradient_accumulation_steps == 0                            
+                        if args.fp16:
+                            with amp.scale_loss(loss, optimizer.optimizer, delay_overflow_check = True, delay_unscale = True) as scaled_loss:
+                                #with Timer("backward"):
+                                scaled_loss.backward()
+                                #t5 = time.time()
+                            if amp._amp_state.opt_properties.patch_torch_functions:
+                                amp._amp_state.handle._clear_cache()
+                        else:
+                             loss.backward()
                     
                     if is_comm_step:
-                        #with Timer("step"):
-                        #t0 = time.time()
-                        global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step, device)
-                        #t1 = time.time()
+                        with Timer("step"):
+                            #t0 = time.time()
+                            global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step, device)
+                            #t1 = time.time()
 
-                        #t3 = time.time()
-                        torch.cuda.synchronize()
-                        average_loss += cpu_buffer.item()
-                        #t4 = time.time()
+                        with Timer("sync"):                            
+                            #t3 = time.time()
+                            torch.cuda.synchronize()
+                            average_loss += cpu_buffer.item()
+                            #t4 = time.time()
                         
-                        if (global_step - 1) % args.log_freq == 0:
-                            if is_main_process():
-                                amlrun.log('lr', optimizer.optimizer.param_groups[0]['lr'])
-                                amlrun.log('train_loss', average_loss)
-                                amlrun.log('throughput', (time.time() - batch_start) / args.log_freq)
-                                print("XXX", global_step, average_loss, (time.time() - batch_start) / args.log_freq, flush=True)
-                            batch_start = time.time()
-                        average_loss = 0.0
+                        if global_step % args.log_freq == 0:
+                            with Timer("log"):                                                        
+                                if is_main_process():
+                                    amlrun.log('lr', optimizer.optimizer.param_groups[0]['lr'])
+                                    amlrun.log('train_loss', average_loss / args.log_freq)
+                                    amlrun.log('throughput', (time.time() - batch_start) / args.log_freq)
+                                    print("XXX", global_step, average_loss / args.log_freq, (time.time() - batch_start) / args.log_freq, flush=True)
+                                batch_start = time.time()
+                                average_loss = 0.0
                     else:
-                        torch.cuda.synchronize()
-                        average_loss += cpu_buffer.item()
+                        with Timer("sync2"):                                                    
+                            torch.cuda.synchronize()
+                            average_loss += cpu_buffer.item()
                     
                     if global_step >= args.max_steps or training_steps % (
                             args.num_steps_per_checkpoint * args.gradient_accumulation_steps) == 0:
