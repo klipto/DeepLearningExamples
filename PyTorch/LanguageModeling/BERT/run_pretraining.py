@@ -49,7 +49,7 @@ from mpi4py import MPI
 from tokenization import BertTokenizer
 from modeling import BertForPreTraining, BertConfig
 from optimization import BertLAMB, BertAdam
-from apex.optimizers import FusedAdam
+from apex.optimizers import FusedAdam, FusedLAMB
 
 from file_utils import PYTORCH_PRETRAINED_BERT_CACHE
 from utils import is_main_process
@@ -344,9 +344,16 @@ def prepare_model_and_optimizer(args, device):
     optimizer = FusedAdam(optimizer_grouped_parameters,
                           lr=args.learning_rate,
                           betas=(0.9, 0.999),
-                          bias_correction=True,
+                          bias_correction=False if args.phase2 else True,
                           eps=1e-6,
                           set_grad_none=False)
+    #optimizer = FusedLAMB(optimizer_grouped_parameters,
+    #                      lr=args.learning_rate,
+    #                      betas=(0.9, 0.999),
+    #                      bias_correction=True, #False if args.phase2 else True,
+    #                      eps=1e-6,
+    #                      max_grad_norm=float('inf'),
+    #                      set_grad_none=False)
 
     if args.fp16:
         if args.loss_scale == 0:
@@ -654,7 +661,7 @@ def main():
                             if args.resume_step < 0 or not args.phase2:
                                 output_save_file = os.path.join(args.output_dir, "ckpt_{}.pt".format(global_step))
                             else:
-                                output_save_file = os.path.join(args.output_dir, "phase2ckpt_{}.pt".format(global_step + args.phase1_end_step))
+                                output_save_file = os.path.join(args.output_dir, "phase2hlrckpt_{}.pt".format(global_step + args.phase1_end_step))
                             if args.do_train:
                                 torch.save({'model': model_to_save.state_dict(),
                                             'optimizer': optimizer.optimizer.state_dict(),
