@@ -49,7 +49,7 @@ from mpi4py import MPI
 from tokenization import BertTokenizer
 from modeling import BertForPreTraining, BertConfig
 from optimization import BertLAMB, BertAdam
-from apex.optimizers import FusedAdam
+from apex.optimizers import FusedAdam, FusedLAMB
 
 from file_utils import PYTORCH_PRETRAINED_BERT_CACHE
 from utils import is_main_process
@@ -336,15 +336,14 @@ def prepare_model_and_optimizer(args, device):
             optimizer_grouped_parameters.append({'params': [p], 'weight_decay': 0.00, 'name': n})
             names.append({'params': [n], 'weight_decay': 0.00})
 
-    #optimizer = BertLAMB(optimizer_grouped_parameters,
-    #                     lr=args.learning_rate,
-    #                     warmup=args.warmup_proportion,
-    #                     t_total=args.max_steps)
-    optimizer = FusedAdam(optimizer_grouped_parameters,
-                          lr=args.learning_rate,
+    optimizer = FusedLAMB(optimizer_grouped_parameters,
                           betas=(0.9, 0.999),
-                          bias_correction=True,
-                          eps=1e-6)
+                          lr=args.learning_rate)
+    # optimizer = FusedAdam(optimizer_grouped_parameters,
+    #                       lr=args.learning_rate,
+    #                       betas=(0.9, 0.999),
+    #                       bias_correction=True,
+    #                       eps=1e-6)
 
     if args.fp16:
         if args.loss_scale == 0:
