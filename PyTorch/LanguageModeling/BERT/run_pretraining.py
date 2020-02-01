@@ -262,16 +262,16 @@ def setup_training(args):
     assert (torch.cuda.is_available())
 
     #device = torch.device("cuda", distributed_optimizers.local_rank())
-    torch.cuda.set_device(distributed_optimizers.local_rank())
-    device = torch.device("cuda", distributed_optimizers.local_rank())
+    torch.cuda.set_device(distributed_optimizers.local_device())
+    device = torch.device("cuda", distributed_optimizers.local_device())
     args.n_gpu = 1
     # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
     #torch.distributed.init_process_group(backend='nccl', init_method='env://')
 
     distributed_optimizers.local_init()
     
-    logger.info("device %s n_gpu %d distributed training %r", device, args.n_gpu, bool(distributed_optimizers.local_rank() != -1))
-    print("device %s n_gpu %d distributed training %r", device, args.n_gpu, bool(distributed_optimizers.local_rank() != -1))
+    logger.info("device %s n_gpu %d distributed training %r", device, args.n_gpu, bool(distributed_optimizers.local_device() != -1))
+    print("device %s n_gpu %d distributed training %r", device, args.n_gpu, bool(distributed_optimizers.local_device() != -1))
 
     if args.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
@@ -342,15 +342,14 @@ def prepare_model_and_optimizer(args, device):
     #                     warmup=args.warmup_proportion,
     #                     t_total=args.max_steps)
     optimizer = FusedAdam(optimizer_grouped_parameters,
-                          lr=args.learning_rate,
-                          betas=(0.9, 0.999),
-                          bias_correction=False if args.phase2 else True,
-                          eps=1e-6,
-                          set_grad_none=False)
+                         lr=args.learning_rate,
+                         betas=(0.9, 0.999),
+                         bias_correction=False if args.phase2 else True,
+                         eps=1e-6,
+                         set_grad_none=False)
     #optimizer = FusedLAMB(optimizer_grouped_parameters,
     #                      lr=args.learning_rate,
     #                      betas=(0.9, 0.999),
-    #                      bias_correction=True, #False if args.phase2 else True,
     #                      eps=1e-6,
     #                      max_grad_norm=float('inf'),
     #                      set_grad_none=False)
