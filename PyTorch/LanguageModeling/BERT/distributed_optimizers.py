@@ -15,8 +15,8 @@ import amp_C
 import time
 from apex import amp
 
-from azureml.core.run import Run
-amlrun = Run.get_context()
+#from azureml.core.run import Run
+#amlrun = Run.get_context()
 
 
 get_num_gpus = lambda: str(subprocess.check_output(["nvidia-smi", "-L"])).count('UUID') if any(os.access(os.path.join(path, 'nvidia-smi'), os.X_OK) for path in os.environ["PATH"].split(os.pathsep)) else 0

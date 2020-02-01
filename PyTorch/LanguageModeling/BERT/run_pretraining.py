@@ -61,8 +61,8 @@ import apex_C
 from apex.amp import _amp_state
 import horovod.torch as hvd
 
-from azureml.core.run import Run
-amlrun = Run.get_context()
+#from azureml.core.run import Run    
+#amlrun = Run.get_context()        
     
 from concurrent.futures import ProcessPoolExecutor
 
@@ -638,9 +638,9 @@ def main():
                         if global_step % args.log_freq == 0:
                             with Timer("log"):                                                        
                                 if is_main_process():
-                                    amlrun.log('lr', optimizer.optimizer.param_groups[0]['lr'])
-                                    amlrun.log('train_loss', average_loss / args.log_freq)
-                                    amlrun.log('throughput', (time.time() - batch_start) / args.log_freq)
+                                    #amlrun.log('lr', optimizer.optimizer.param_groups[0]['lr'])
+                                    #amlrun.log('train_loss', average_loss / args.log_freq)
+                                    #amlrun.log('throughput', (time.time() - batch_start) / args.log_freq)
                                     print("XXX", global_step, average_loss / args.log_freq, (time.time() - batch_start) / args.log_freq, flush=True)
                                 batch_start = time.time()
                                 average_loss = 0.0
