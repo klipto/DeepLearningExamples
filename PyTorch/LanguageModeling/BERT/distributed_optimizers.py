@@ -15,46 +15,63 @@ import amp_C
 import time
 from apex import amp
 
-from azureml.core.run import Run
-amlrun = Run.get_context()
+#from azureml.core.run import Run
+#amlrun = Run.get_context()
+
+
+get_num_gpus = lambda: str(subprocess.check_output(["nvidia-smi", "-L"])).count('UUID') if any(os.access(os.path.join(path, 'nvidia-smi'), os.X_OK) for path in os.environ["PATH"].split(os.pathsep)) else 0
+import os
+num_devices = int(os.environ['HOROVOD_NUM_GPUS_PER_LOCAL_GROUP'])
+num_gpus = get_num_gpus()
+assert num_devices <= num_gpus
+assert num_gpus % num_devices == 0
+torch_group = None
 
 def local_init():
-    import torch
+    global torch_group
     torch.distributed.init_process_group(backend="nccl",
                                          init_method="file:///tmp/distributed_test",
-                                         world_size=num_devices,
-                                         rank=local_rank())
+                                         world_size=num_gpus,
+                                         rank=MPI.COMM_WORLD.rank % num_gpus)
+    for group_num in range(num_gpus//num_gpus):
+        group_ids = range(group_num*num_gpus, (group_num+1)*num_gpus)
+        cur_group = torch.distributed.new_group(ranks=group_ids)
+        if torch.distributed.get_rank()//num_gpus == group_num:
+            torch_group = cur_group
+                                                            
+def local_device():
+    return world_rank() % num_gpus
 
 def local_reduce_sum_(tensor, rank):
-    torch.distributed.reduce(tensor, dst = rank, async_op=False)
+    torch.distributed.reduce(tensor, dst = rank, async_op=False, group=torch_group)
     return None
 
 def local_reduce_sum_async_(tensor, rank):
-    return torch.distributed.reduce(tensor, dst = rank, async_op=True)
+    return torch.distributed.reduce(tensor, dst = rank, async_op=True, group=torch_group)
     return None
 
 def local_allreduce_sum_async_(tensor, root=0):
-    handle = torch.distributed.all_reduce(tensor, async_op=True)
+    handle = torch.distributed.all_reduce(tensor, async_op=True, group=torch_group)
     return handle
 
 def local_allreduce_sum_(tensor, root=0):
-    handle = torch.distributed.all_reduce(tensor, async_op=False)
+    handle = torch.distributed.all_reduce(tensor, async_op=False, group=torch_group)
     return handle
 
 def local_allreduce_mean_async_(tensor, root=0):
     import torch
     tensor.div_(local_size())
-    handle = torch.distributed.all_reduce(tensor, async_op=True)
+    handle = torch.distributed.all_reduce(tensor, async_op=True, group=torch_group)
     return handle
 
 def local_broadcast_async_(tensor, root=0):
     import torch
-    handle = torch.distributed.broadcast(tensor, src=root, async_op=True)
+    handle = torch.distributed.broadcast(tensor, src=root, async_op=True, group=torch_group)
     return handle
 
 def local_broadcast_sync_(tensor, root=0):
     import torch
-    torch.distributed.broadcast(tensor, src=root, async_op=False)
+    torch.distributed.broadcast(tensor, src=root, async_op=False, group=torch_group)
 
 def local_rank():
     return world_rank() % num_devices
@@ -67,9 +84,6 @@ def world_rank():
 
 def world_size():
     return MPI.COMM_WORLD.size
-
-get_num_gpus = lambda: str(subprocess.check_output(["nvidia-smi", "-L"])).count('UUID') if any(os.access(os.path.join(path, 'nvidia-smi'), os.X_OK) for path in os.environ["PATH"].split(os.pathsep)) else 0
-num_devices = get_num_gpus()
 
 from contextlib import contextmanager
 
