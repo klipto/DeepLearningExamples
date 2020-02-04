@@ -33,7 +33,7 @@ def local_init():
                                          init_method="file:///tmp/distributed_test",
                                          world_size=num_gpus,
                                          rank=MPI.COMM_WORLD.rank % num_gpus)
-    for group_num in range(world_size()//num_devices):
+    for group_num in range(num_gpus//num_devices):
         group_ids = range(group_num*num_devices, (group_num+1)*num_devices)
         cur_group = torch.distributed.new_group(ranks=group_ids)
         if torch.distributed.get_rank()//num_devices== group_num:
