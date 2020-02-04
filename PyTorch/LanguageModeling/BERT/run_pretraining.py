@@ -247,6 +247,12 @@ def parse_arguments():
                         default=False,
                         action='store_true',
                         help="Whether to run training.")
+
+    parser.add_argument("--do_lamb",
+                        default=False,
+                        action='store_true',
+                        help="Whether to run with adasum+lamb.")
+    
     args = parser.parse_args()
     return args
 
@@ -341,18 +347,19 @@ def prepare_model_and_optimizer(args, device):
     #                     lr=args.learning_rate,
     #                     warmup=args.warmup_proportion,
     #                     t_total=args.max_steps)
-    optimizer = FusedAdam(optimizer_grouped_parameters,
-                         lr=args.learning_rate,
-                         betas=(0.9, 0.999),
-                         bias_correction=False if args.phase2 else True,
-                         eps=1e-6,
-                         set_grad_none=False)
-    #optimizer = FusedLAMB(optimizer_grouped_parameters,
-    #                      lr=args.learning_rate,
-    #                      betas=(0.9, 0.999),
-    #                      eps=1e-6,
-    #                      max_grad_norm=float('inf'),
-    #                      set_grad_none=False)
+    if args.do_lamb:        
+        optimizer = FusedLAMB(optimizer_grouped_parameters,
+                              lr=args.learning_rate,
+                              betas=(0.9, 0.999),
+                              eps=1e-6,
+                              set_grad_none=False)
+    else:
+        optimizer = FusedAdam(optimizer_grouped_parameters,
+                             lr=args.learning_rate,
+                             betas=(0.9, 0.999),
+                             bias_correction=False if args.phase2 else True,
+                             eps=1e-6,
+                             set_grad_none=False)
 
     if args.fp16:
         if args.loss_scale == 0:
@@ -365,7 +372,7 @@ def prepare_model_and_optimizer(args, device):
                     master_weights=False if args.accumulate_into_fp16 else True)
         amp._amp_state.loss_scalers[0]._loss_scale = 2**20
 
-    from distributed_optimizers import DistributedAdasumOptimizer
+    from distributed_optimizers import DistributedAdasumOptimizer, DistributedAdasumForLambOptimizer
     compression = hvd.Compression.fp16 #if args.fp16_allreduce else hvd.Compression.none
     if False: #args.phase2:
         optimizer = DistributedCpuAdasumOptimizer(optimizer, compression=compression)
@@ -374,9 +381,14 @@ def prepare_model_and_optimizer(args, device):
         #                                 compression=compression)
         print("Created Adasum optimizer for CPU reduction.")
     else:
-        optimizer = DistributedAdasumOptimizer(optimizer,
-                                        backward_passes_per_step=args.gradient_accumulation_steps,
-                                        compression=compression)
+        if args.do_lamb:
+            optimizer = DistributedAdasumForLambOptimizer(optimizer,
+                                                          backward_passes_per_step=args.gradient_accumulation_steps,
+                                                          compression=compression)
+        else:            
+            optimizer = DistributedAdasumOptimizer(optimizer,
+                                                   backward_passes_per_step=args.gradient_accumulation_steps,
+                                                   compression=compression)
         print("Created distributed Adasum optimizer.")
 
     if args.resume_from_checkpoint:
@@ -474,7 +486,7 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step, devic
     else:
         # toddm: only for fusedadam
         from optimization import warmup_poly, warmup_linear
-        warmup = warmup_linear
+        warmup = warmup_poly
         tmp = warmup(global_step / args.max_steps, args.warmup_proportion)
         for group in optimizer.optimizer.param_groups:
             group['lr'] = args.learning_rate * tmp
