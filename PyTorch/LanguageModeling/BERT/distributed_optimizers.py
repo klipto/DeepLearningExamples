@@ -26,9 +26,9 @@ num_gpus = get_num_gpus()
 assert num_devices <= num_gpus
 assert num_gpus % num_devices == 0
 torch_group = None
-
+group_id = None
 def local_init():
-    global torch_group
+    global torch_group, group_id
     torch.distributed.init_process_group(backend="nccl",
                                          init_method="file:///tmp/distributed_test",
                                          world_size=num_gpus,
@@ -38,16 +38,17 @@ def local_init():
         cur_group = torch.distributed.new_group(ranks=group_ids)
         if torch.distributed.get_rank()//num_devices== group_num:
             torch_group = cur_group
+            group_id = group_num
                                                             
 def local_device():
     return world_rank() % num_gpus
 
 def local_reduce_sum_(tensor, rank):
-    torch.distributed.reduce(tensor, dst = rank, async_op=False, group=torch_group)
+    torch.distributed.reduce(tensor, dst = rank+group_id*num_devices, async_op=False, group=torch_group)
     return None
 
 def local_reduce_sum_async_(tensor, rank):
-    return torch.distributed.reduce(tensor, dst = rank, async_op=True, group=torch_group)
+    return torch.distributed.reduce(tensor, dst = rank+group_id*num_devices, async_op=True, group=torch_group)
     return None
 
 def local_allreduce_sum_async_(tensor, root=0):
@@ -66,12 +67,12 @@ def local_allreduce_mean_async_(tensor, root=0):
 
 def local_broadcast_async_(tensor, root=0):
     import torch
-    handle = torch.distributed.broadcast(tensor, src=root, async_op=True, group=torch_group)
+    handle = torch.distributed.broadcast(tensor, src=root+group_id*num_devices, async_op=True, group=torch_group)
     return handle
 
 def local_broadcast_sync_(tensor, root=0):
     import torch
-    torch.distributed.broadcast(tensor, src=root, async_op=False, group=torch_group)
+    torch.distributed.broadcast(tensor, src=root+group_id*num_devices, async_op=False, group=torch_group)
 
 def local_rank():
     return world_rank() % num_devices
