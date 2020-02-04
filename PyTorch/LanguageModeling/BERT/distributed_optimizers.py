@@ -381,11 +381,9 @@ class DistributedAdasumForLambOptimizer(DistributedAdasumOptimizer):
         super(DistributedAdasumForLambOptimizer, self).__init__(optimizer, compression, backward_passes_per_step, True)
 
     def _allreduce_grad_async(self, param_index, scalar, group, p, start, master):
-        owner = self.owner[param_index]
         handle = local_allreduce_sum_async_(p.grad)
-        if local_rank() == owner:
-            if self._is_first:
-                master.data.copy_(p.data)
+        if self._is_first:
+            master.data.copy_(p.data)
         return handle, (p, param_index, scalar, start, group, master)
 
     def step(self, closure=None):
@@ -454,10 +452,9 @@ class DistributedAdasumForLambOptimizer(DistributedAdasumOptimizer):
                 else:
                     print("Layer {} had overflow: new scale {}: rank: {}".format(
                         param_index, scalar.loss_scale, world_rank()), flush=True)
-                scalar.update_scale(layer_had_overflow)
-                master.data.copy_(p.data) 
-            handle = local_broadcast_async_(p.data, root=owner)
-            local_handles.append(handle)
+                scalar.update_scale(layer_had_overflow)                
+            handle = local_broadcast_async_(p.data, root=owner)            
+            local_handles.append((p, master, handle))
 
         #with Timer("cleanup"):
         amp_scale._has_overflow = had_overflow
@@ -469,5 +466,6 @@ class DistributedAdasumForLambOptimizer(DistributedAdasumOptimizer):
         self.optimizer.zero_grad()
         self._is_first = False        
 
-        for handle in local_handles:
+        for p, master, handle in local_handles:
             handle.wait()
+            master.data.copy_(p.data) 
