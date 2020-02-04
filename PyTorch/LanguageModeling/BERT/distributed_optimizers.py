@@ -33,10 +33,10 @@ def local_init():
                                          init_method="file:///tmp/distributed_test",
                                          world_size=num_gpus,
                                          rank=MPI.COMM_WORLD.rank % num_gpus)
-    for group_num in range(num_gpus//num_gpus):
-        group_ids = range(group_num*num_gpus, (group_num+1)*num_gpus)
+    for group_num in range(world_size()//num_devices):
+        group_ids = range(group_num*num_devices, (group_num+1)*num_devices)
         cur_group = torch.distributed.new_group(ranks=group_ids)
-        if torch.distributed.get_rank()//num_gpus == group_num:
+        if torch.distributed.get_rank()//num_devices== group_num:
             torch_group = cur_group
                                                             
 def local_device():
@@ -176,7 +176,7 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
 
         
         self._register_hooks()
-        amp._amp_state.loss_scalers[0]._loss_scale = 2**15
+        #amp._amp_state.loss_scalers[0]._loss_scale = 2**15
         
     def _register_hooks(self):
         self.optimizer._amp_lazy_init() # why they lazily init is beyond me... its such a headache.
@@ -243,11 +243,6 @@ class DistributedAdasumOptimizer(torch.optim.Optimizer):
                 fp16_grads.append(p.grad)
                 fp32_grads.append(master.grad)
                 handle.wait()
-                #amp_C.multi_tensor_scale(65536,
-                #                         amp_scale._overflow_buf,
-                #                         [[p.grad], [master.grad]],
-                #                         scale)
-                #norm_sq += master.grad.data.norm(p=2)**2                
             else:
                 handle.wait()
 
