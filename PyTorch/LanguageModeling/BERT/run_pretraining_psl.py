@@ -375,10 +375,10 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, adasum_scalar, glo
         # check for Inf/NaN
         # 1. allocate an uninitialized buffer for flattened gradient
         scaler = _amp_state.loss_scalers[0]
-
+            
         # 2. update loss scale
         hvd.allreduce_(scaler._overflow_buf, op=hvd.Sum)
-
+        
         had_overflow = scaler._overflow_buf.item() > 0
         scaler._has_overflow = had_overflow
         tmp = scaler.update_scale()
@@ -390,6 +390,9 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, adasum_scalar, glo
             params = [p for p in amp.master_params(optimizer) if p.grad is not None]
             starts = [p.clone().detach() for p in params]
             
+            for start, current in zip(starts, params):
+                start.data.copy_(current.data)
+                
             optimizer.step()
 
             handles = []
@@ -402,12 +405,13 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, adasum_scalar, glo
                 normsq_handle = hvd.allreduce_async(norm_sq,name='nsq%i'%index, op=hvd.Sum)
                 handles.append((adasum_handle, normsq_handle, start, current))
 
-            overflow_buf.zero_()
+                
             deltas = []
             for index, (adasum_handle, normsq_handle, start, current) in enumerate(handles):
                 delta = hvd.synchronize(adasum_handle).to(torch.float32)
                 deltas.append(delta)
-
+                
+            overflow_buf.zero_()
             amp_C.multi_tensor_scale(65536,
                                      overflow_buf,
                                      [deltas, deltas],
@@ -422,19 +426,32 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, adasum_scalar, glo
                     a = hvd.synchronize(normsq_handle)
                     if is_main_process():
                         print("bad_shadow", index, delta.norm(p=2).item() / torch.sqrt(a).item(), flush=True)
+                        
+                    # reset to start
                     current.data.copy_(start)
+
+                if _amp_state.opt_properties.master_weights:
+                    for param in optimizer._amp_stash.all_fp32_from_fp16_params:
+                        param.grad = None
+                    
                 if is_main_process():
                     print("Layer {} had overflow: new scale {}".format(
                         index, adasum_scalar.loss_scale))
+                    
             else:
                 for index, (adasum_handle, normsq_handle, start, current) in enumerate(handles):
                     delta = deltas[index]
                     a = hvd.synchronize(normsq_handle)
+                    #tmp = delta.clone().detach()
+                    #hvd.broadcast_(tmp, 0)
+                    #print("RRR", hvd.rank(), index, (tmp-delta).norm().item(), flush=True)
+                    
                     if is_main_process():
                         print("shadow", index, delta.norm(p=2).item() / torch.sqrt(a).item(), flush=True)
                     
                     start.add_(delta)
                     current.data.copy_(start)
+                    
                 global_step += 1
                     
             # copy back to apex model fp16 params
@@ -456,12 +473,12 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, adasum_scalar, glo
         for param in model.parameters():
             param.grad = None
 
-        for param in amp.master_params(optimizer):
-            norm = param.data.norm(p=2)
-            tmp = torch.zeros_like(norm, requires_grad=False)
-            tmp.data.copy_(norm)
-            hvd.broadcast_(tmp, 0)
-            assert norm.item() == tmp.item(), "hvd mismatch"
+        # for index, param in enumerate(amp.master_params(optimizer)):
+        #     tmp = param.clone().detach()
+        #     hvd.broadcast_(tmp, 0)
+        #     norm = (param.data - tmp).norm(p=2)
+        #     print("XXXX", index, norm)
+            #assert norm.item() == tmp.item(), "hvd mismatch"
 
     else:
         optimizer.step()
