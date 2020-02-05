@@ -25,8 +25,11 @@ import csv
 import os
 #os.environ['MASTER_ADDR'] = 'mmmramengw'
 os.environ['MASTER_PORT'] = '52578'
-os.environ['RANK'] = os.environ['OMPI_COMM_WORLD_RANK']
-os.environ['WORLD_SIZE'] = os.environ['OMPI_COMM_WORLD_SIZE']
+#os.environ['RANK'] = os.environ['OMPI_COMM_WORLD_RANK']
+#os.environ['WORLD_SIZE'] = os.environ['OMPI_COMM_WORLD_SIZE']
+os.environ['RANK'] = os.environ['PMI_RANK']
+os.environ['WORLD_SIZE'] = os.environ['PMI_SIZE']
+
 import time
 import logging
 import argparse
@@ -390,44 +393,47 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, adasum_scalar, glo
                 norm_sq = current.data.norm(p=2,dtype=torch.float32)**2
                 current.data.mul_(adasum_scalar.loss_scale)
                 delta = current.data.to(torch.float16)
-                adasum_handle = hvd.allreduce_async_(delta, name='all%i'%index, op=hvd.Adasum)
+                adasum_handle = hvd.allreduce_async(delta, name='all%i'%index, op=hvd.Adasum)
                 normsq_handle = hvd.allreduce_async(norm_sq,name='nsq%i'%index, op=hvd.Sum)
                 handles.append((adasum_handle, normsq_handle, start, current))
 
             overflow_buf.zero_()
-            deltas = [
-                hvd.synchronize(adasum_handle).to(torch.float32)                
-                for index, (adasum_handle, normsq_handle, start, current) in enumerate(handles)
-            ]
+            deltas = []
+            for index, (adasum_handle, normsq_handle, start, current) in enumerate(handles):
+                delta = hvd.synchronize(adasum_handle).to(torch.float32)
+                deltas.append(delta)
+
             amp_C.multi_tensor_scale(65536,
                                      overflow_buf,
                                      [deltas, deltas],
                                      1.0 / adasum_scalar.loss_scale)
             
             adasum_had_overflow = overflow_buf.item() == 1
-            
-            for index, (adasum_handle, normsq_handle, start, current) in enumerate(handles):
-                delta = deltas[index]
-                a = hvd.synchronize(normsq_handle)
-                
-                if adasum_had_overflow == False and is_main_process():
-                    print("shadow", index, delta.norm(p=2).item() / torch.sqrt(a).item(), flush=True)
-                    
-                if not adasum_had_overflow:
-                    start.add_(delta)
-                                    
-                current.data.copy_(start)
-
             adasum_scalar.update_scale(adasum_had_overflow)
             
-            if adasum_had_overflow and is_main_process():
-                print("Layer {} had overflow: new scale {}".format(
-                    index, adasum_scalar.loss_scale))
-
-            if not adasum_had_overflow:                
+            if adasum_had_overflow:
+                for index, (adasum_handle, normsq_handle, start, current) in enumerate(handles):
+                    delta = deltas[index]
+                    a = hvd.synchronize(normsq_handle)
+                    if is_main_process():
+                        print("bad_shadow", index, delta.norm(p=2).item() / torch.sqrt(a).item(), flush=True)
+                    current.data.copy_(start)
+                if is_main_process():
+                    print("Layer {} had overflow: new scale {}".format(
+                        index, adasum_scalar.loss_scale))
+            else:
+                for index, (adasum_handle, normsq_handle, start, current) in enumerate(handles):
+                    delta = deltas[index]
+                    a = hvd.synchronize(normsq_handle)
+                    if is_main_process():
+                        print("shadow", index, delta.norm(p=2).item() / torch.sqrt(a).item(), flush=True)
+                    
+                    start.add_(delta)
+                    current.data.copy_(start)
                 global_step += 1
-                
-            optimizer._master_params_to_model_params()
+                    
+            # copy back to apex model fp16 params
+            optimizer._master_params_to_model_params()            
             
         else:
             # Overflow detected, print message and clear gradients
@@ -444,7 +450,14 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, adasum_scalar, glo
         
         for param in model.parameters():
             param.grad = None
-            
+
+        for param in amp.master_params(optimizer):
+            norm = param.data.norm(p=2)
+            tmp = torch.zeros_like(norm, requires_grad=False)
+            tmp.data.copy_(norm)
+            hvd.broadcast_(tmp, 0)
+            assert norm.item() == tmp.item(), "hvd mismatch"
+
     else:
         optimizer.step()
         #optimizer.zero_grad()
