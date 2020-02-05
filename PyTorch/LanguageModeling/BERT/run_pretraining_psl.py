@@ -243,17 +243,22 @@ def setup_training(args):
 
     assert (torch.cuda.is_available())
     assert args.local_rank == -1
-    args.local_rank = int(os.environ['RANK']) % 4
-    if args.local_rank == -1:
-        device = torch.device("cuda")
-        args.n_gpu = torch.cuda.device_count()
-    else:
-        torch.cuda.set_device(args.local_rank)
-        device = torch.device("cuda", args.local_rank)
-        args.n_gpu = 1
+#    args.local_rank = int(os.environ['RANK']) % 4
+#    if args.local_rank == -1:
+#        device = torch.device("cuda")
+#        args.n_gpu = torch.cuda.device_count()
+#    else:
+#        torch.cuda.set_device(args.local_rank)
+#        device = torch.device("cuda", args.local_rank)
+#        args.n_gpu = 1
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         #torch.distributed.init_process_group(backend='nccl', init_method='env://')
-        hvd.init()
+#        hvd.init()
+    hvd.init()
+    args.local_rank = hvd.local_rank()
+    torch.cuda.set_device(args.local_rank)
+    device = torch.device("cuda", args.local_rank)
+    args.n_gpu = 1
 
     print("device {} n_gpu {} distributed training {}".format(device, args.n_gpu, bool(args.local_rank != -1)), flush=True)
 
