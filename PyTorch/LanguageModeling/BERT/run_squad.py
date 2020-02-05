@@ -23,6 +23,17 @@ import json
 import logging
 import math
 import os
+master_node_params = os.environ['AZ_BATCH_MASTER_NODE'].split(':')
+os.environ['MASTER_ADDR'] = master_node_params[0]
+os.environ['MASTER_PORT'] = master_node_params[1]
+if 'PMI_RANK' in os.environ:
+    os.environ['RANK'] = os.environ['PMI_RANK']
+    os.environ['WORLD_SIZE'] = os.environ['PMI_SIZE'] 
+
+if 'OMPI_COMM_WORLD_RANK' in os.environ:
+    os.environ['RANK'] = os.environ['OMPI_COMM_WORLD_RANK']
+    os.environ['WORLD_SIZE'] = os.environ['OMPI_COMM_WORLD_SIZE']
+    
 import random
 import sys
 from io import open
@@ -885,6 +896,7 @@ def main():
                         help='frequency of logging loss.')
     args = parser.parse_args()
 
+    args.local_rank = int(os.environ['RANK']) % 4
     if args.local_rank == -1 or args.no_cuda:
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
         n_gpu = torch.cuda.device_count()
@@ -924,7 +936,7 @@ def main():
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and os.listdir(args.output_dir)!=['logfile.txt']:
         print("WARNING: Output directory {} already exists and is not empty.".format(args.output_dir), os.listdir(args.output_dir))
     if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
+        os.makedirs(args.output_dir, exist_ok=True)
 
     tokenizer = BertTokenizer(args.vocab_file, do_lower_case=args.do_lower_case, max_len=512) # for bert large
     # tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
@@ -1047,6 +1059,8 @@ def main():
         model.train()
         gradClipper = GradientClipper(max_grad_norm=1.0)
         for _ in trange(int(args.num_train_epochs), desc="Epoch"):
+            if args.local_rank != -1:
+                train_sampler.set_epoch(_)
             for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
                 # Terminate early for benchmarking
                 

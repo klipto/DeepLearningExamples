@@ -23,6 +23,10 @@ from __future__ import print_function
 # ==================
 import csv
 import os
+os.environ['MASTER_ADDR'] = os.environ['PHILLY_CONTAINER_IP']
+os.environ['MASTER_PORT'] = '52578'
+os.environ['RANK'] = os.environ['PMI_RANK']
+os.environ['WORLD_SIZE'] = os.environ['PMI_SIZE']
 import time
 import logging
 import argparse
@@ -229,7 +233,8 @@ def parse_arguments():
 def setup_training(args):
 
     assert (torch.cuda.is_available())
-
+    assert args.local_rank == -1
+    args.local_rank = int(os.environ['RANK']) % 4
     if args.local_rank == -1:
         device = torch.device("cuda")
         args.n_gpu = torch.cuda.device_count()
@@ -240,7 +245,7 @@ def setup_training(args):
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.distributed.init_process_group(backend='nccl', init_method='env://')
 
-    logger.info("device %s n_gpu %d distributed training %r", device, args.n_gpu, bool(args.local_rank != -1))
+    print("device {} n_gpu {} distributed training {}".format(device, args.n_gpu, bool(args.local_rank != -1)), flush=True)
 
     if args.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
@@ -292,7 +297,7 @@ def prepare_model_and_optimizer(args, device):
         if args.phase2:
             global_step -= args.phase1_end_step
         if is_main_process():
-            print("resume step from ", args.resume_step)
+            print("resume step from ", args.resume_step, flush=True)
 
     model.to(device)
     param_optimizer = list(model.named_parameters())
@@ -388,7 +393,7 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
                 print(("Rank {} :: Gradient overflow.  Skipping step, "  +
                         "reducing loss scale to {}").format(
                         torch.distributed.get_rank(),
-                        scaler.loss_scale()))
+                            scaler.loss_scale()), flush=True)
             if _amp_state.opt_properties.master_weights:
                 for param in optimizer._amp_stash.all_fp32_from_fp16_params:
                     param.grad = None
@@ -416,15 +421,15 @@ def main():
     model, optimizer, lr_scheduler, checkpoint, global_step = prepare_model_and_optimizer(args, device)
 
     if is_main_process():
-        print("SEED {}".format(args.seed))
+        print("SEED {}".format(args.seed),flush=True)
 
     if args.do_train:
         if is_main_process():
-            logger.info("***** Running training *****")
+            print("***** Running training *****", flush=True)
             # logger.info("  Num examples = %d", len(train_data))
-            logger.info("  Batch size = %d", args.train_batch_size)
-            print("  LR = ", args.learning_rate)
-            print("Training. . .")
+            print("  Batch size =", args.train_batch_size, flush=True)
+            print("  LR = ", args.learning_rate, flush=True)
+            print("Training. . .", flush=True)
 
         model.train()
         most_recent_ckpts_paths = []
@@ -433,7 +438,8 @@ def main():
         training_steps = 0
 
         pool = ProcessPoolExecutor(1)
-
+        batch_start = time.time()
+        
         # Note: We loop infinitely over epochs, termination is handled via iteration count
         while True:
             thread = None
@@ -482,13 +488,14 @@ def main():
                 else:
                     data_file = files[(f_id*torch.distributed.get_world_size()+torch.distributed.get_rank())%num_files]
 
-                logger.info("file no %s file %s" % (f_id, previous_file))
+                print("file no %s file %s" % (f_id, previous_file))
 
                 previous_file = data_file
 
                 dataset_future = pool.submit(create_pretraining_dataset, data_file, args.max_predictions_per_seq, shared_file_list, args)
 
-                train_iter = tqdm(train_dataloader, desc="Iteration") if is_main_process() else train_dataloader
+                #train_iter = tqdm(train_dataloader, desc="Iteration") if is_main_process() else train_dataloader
+                train_iter = train_dataloader
                 for step, batch in enumerate(train_iter):
 
                     training_steps += 1
@@ -526,21 +533,22 @@ def main():
                             average_loss /= torch.distributed.get_world_size()
                             torch.distributed.all_reduce(average_loss)
                         if is_main_process():
-                            logger.info("Total Steps:{} Final Loss = {}".format(training_steps / args.gradient_accumulation_steps, average_loss.item()))
+                            print("Total Steps:{} Final Loss = {}".format(training_steps / args.gradient_accumulation_steps, average_loss.item()), flush=True)
                     elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
                         if is_main_process():
-                            print("Step:{} Average Loss = {} Step Loss = {} LR {}".format(global_step, average_loss / (
+                            print("Step:{} Average Loss = {} Step Loss = {} LR {} time {}".format(global_step, average_loss / (
                                         args.log_freq * divisor),
                                                                                             loss.item() * args.gradient_accumulation_steps / divisor,
                                                                                             optimizer.param_groups[0][
-                                                                                                'lr']))
+                                                                                                'lr'], time.time() - batch_start), flush=True)
+                        batch_start = time.time()
                         average_loss = 0
 
                     if global_step >= args.max_steps or training_steps % (
                             args.num_steps_per_checkpoint * args.gradient_accumulation_steps) == 0:
                         if is_main_process():
                             # Save a trained model
-                            logger.info("** ** * Saving fine - tuned model ** ** * ")
+                            print("** ** * Saving fine - tuned model ** ** * ")
                             model_to_save = model.module if hasattr(model,
                                                                     'module') else model  # Only save the model it-self
                             if args.resume_step < 0 or not args.phase2:
@@ -576,4 +584,4 @@ if __name__ == "__main__":
     now = time.time()
     args = main()
     if is_main_process():
-        print("Total time taken {}".format(time.time() - now))
+        print("Total time taken {}".format(time.time() - now), flush=True)
