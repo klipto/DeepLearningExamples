@@ -25,8 +25,8 @@ import csv
 import os
 #os.environ['MASTER_ADDR'] = 'mmmramengw'
 os.environ['MASTER_PORT'] = '52578'
-os.environ['RANK'] = os.environ['PMI_RANK']
-os.environ['WORLD_SIZE'] = os.environ['PMI_SIZE']
+os.environ['RANK'] = os.environ['OMPI_COMM_WORLD_RANK']
+os.environ['WORLD_SIZE'] = os.environ['OMPI_COMM_WORLD_SIZE']
 import time
 import logging
 import argparse
@@ -424,8 +424,10 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, adasum_scalar, glo
                 print("Layer {} had overflow: new scale {}".format(
                     index, adasum_scalar.loss_scale))
 
-            if not adasum_had_overflow:
+            if not adasum_had_overflow:                
                 global_step += 1
+                
+            optimizer._master_params_to_model_params()
             
         else:
             # Overflow detected, print message and clear gradients
