@@ -23,12 +23,12 @@ from __future__ import print_function
 # ==================
 import csv
 import os
-#os.environ['MASTER_ADDR'] = 'mmmramengw'
-os.environ['MASTER_PORT'] = '52578'
+##os.environ['MASTER_ADDR'] = 'mmmramengw'
+#os.environ['MASTER_PORT'] = '52578'
 #os.environ['RANK'] = os.environ['OMPI_COMM_WORLD_RANK']
 #os.environ['WORLD_SIZE'] = os.environ['OMPI_COMM_WORLD_SIZE']
-os.environ['RANK'] = os.environ['PMI_RANK']
-os.environ['WORLD_SIZE'] = os.environ['PMI_SIZE']
+#os.environ['RANK'] = os.environ['PMI_RANK']
+#os.environ['WORLD_SIZE'] = os.environ['PMI_SIZE']
 
 import time
 import logging
