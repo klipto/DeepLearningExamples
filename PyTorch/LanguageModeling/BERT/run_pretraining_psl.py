@@ -381,14 +381,15 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, adasum_scalar, glo
         
         had_overflow = scaler._overflow_buf.item() > 0
         scaler._has_overflow = had_overflow
-        tmp = scaler.update_scale()
-        assert tmp == had_overflow
-                
+        scaler.update_scale()
+        
         # 4. call optimizer step function
         if had_overflow == False:
 
             params = [p for p in amp.master_params(optimizer) if p.grad is not None]
             starts = [p.clone().detach() for p in params]
+
+            assert all([torch.isfinite(start).all().item() for start in starts])
             
             for start, current in zip(starts, params):
                 start.data.copy_(current.data)
@@ -399,16 +400,31 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, adasum_scalar, glo
             for index, (start, current) in enumerate(zip(starts, params)):
                 current.data.sub_(start)
                 norm_sq = current.data.norm(p=2,dtype=torch.float32)**2
+                if index == 397:
+                    print("RRRR",hvd.rank(),current.data,flush=True)
+                #if index == 397 and global_step == 2 and hvd.rank() == 0:
+                #    current.data[0] = float('nan')
+                    
                 current.data.mul_(adasum_scalar.loss_scale)
+                #assert torch.isfinite(current.data).all().item()
+                if index == 397:
+                    print("R0",hvd.rank(),current.data,flush=True)
                 delta = current.data.to(torch.float16)
+                if index == 397:
+                    print("R1",hvd.rank(),delta.data,flush=True)
+
+                #assert torch.isfinite(delta.data).all().item()
                 adasum_handle = hvd.allreduce_async(delta, name='all%i'%index, op=hvd.Adasum)
                 normsq_handle = hvd.allreduce_async(norm_sq,name='nsq%i'%index, op=hvd.Sum)
                 handles.append((adasum_handle, normsq_handle, start, current))
-
                 
             deltas = []
             for index, (adasum_handle, normsq_handle, start, current) in enumerate(handles):
                 delta = hvd.synchronize(adasum_handle).to(torch.float32)
+                #assert torch.isfinite(delta.data).all().item()
+                if index == 397:
+                    print("QQQ",hvd.rank(),current.data,flush=True)
+                
                 deltas.append(delta)
                 
             overflow_buf.zero_()
@@ -422,7 +438,7 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, adasum_scalar, glo
             
             if adasum_had_overflow:
                 for index, (adasum_handle, normsq_handle, start, current) in enumerate(handles):
-                    delta = deltas[index]
+                    delta = deltas[index]                    
                     a = hvd.synchronize(normsq_handle)
                     if is_main_process():
                         print("bad_shadow", index, delta.norm(p=2).item() / torch.sqrt(a).item(), flush=True)
@@ -441,6 +457,7 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, adasum_scalar, glo
             else:
                 for index, (adasum_handle, normsq_handle, start, current) in enumerate(handles):
                     delta = deltas[index]
+                    assert torch.isfinite(delta.data).all().item()
                     a = hvd.synchronize(normsq_handle)
                     #tmp = delta.clone().detach()
                     #hvd.broadcast_(tmp, 0)
@@ -452,8 +469,10 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, adasum_scalar, glo
                     start.add_(delta)
                     current.data.copy_(start)
                     
-                global_step += 1
-                    
+                #global_step += 1
+
+            assert all([torch.isfinite(param).all().item() for param in params])
+            
             # copy back to apex model fp16 params
             optimizer._master_params_to_model_params()            
             
@@ -469,9 +488,10 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, adasum_scalar, glo
                     param.grad = None
                     
         scaler.clear_overflow_state()
-        
-        for param in model.parameters():
-            param.grad = None
+        global_step += 1
+        optimizer.zero_grad()
+        #for param in model.parameters():
+        #    param.grad = None
 
         # for index, param in enumerate(amp.master_params(optimizer)):
         #     tmp = param.clone().detach()
@@ -520,7 +540,7 @@ def main():
         batch_start = time.time()
         
         pool = ProcessPoolExecutor(1)
-        adasum_scalar = DynamicLossScaler(init_scale=2**18)
+        adasum_scalar = DynamicLossScaler()#init_scale=2**18)
         
         # Note: We loop infinitely over epochs, termination is handled via iteration count
         while True:
