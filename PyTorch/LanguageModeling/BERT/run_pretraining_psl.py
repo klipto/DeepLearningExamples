@@ -236,6 +236,12 @@ def parse_arguments():
                         default=False,
                         action='store_true',
                         help="Whether to run training.")
+
+    parser.add_argument("--do_lamb",
+                        default=False,
+                        action='store_true',
+                        help="Whether to run lamb for training.")
+    
     args = parser.parse_args()
     return args
 
@@ -322,12 +328,21 @@ def prepare_model_and_optimizer(args, device):
         {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
         {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}]
 
-    optimizer = FusedLAMB(optimizer_grouped_parameters,
-                          betas=(0.9, 0.999),
-                          lr=args.learning_rate)
-    lr_scheduler = PolyWarmUpScheduler(optimizer, 
-                                       warmup=args.warmup_proportion, 
-                                       total_steps=args.max_steps)
+    if args.do_lamb:
+        optimizer = FusedLAMB(optimizer_grouped_parameters,
+                              betas=(0.9, 0.999),
+                              lr=args.learning_rate)
+        lr_scheduler = PolyWarmUpScheduler(optimizer, 
+                                           warmup=args.warmup_proportion, 
+                                           total_steps=args.max_steps)
+    else:
+        optimizer = FusedAdam(optimizer_grouped_parameters,
+                              betas=(0.9, 0.999),
+                              lr=args.learning_rate)
+        lr_scheduler = LinearWarmUpScheduler(optimizer,
+                                             warmup=args.warmup_proportion, 
+                                             total_steps=args.max_steps)
+        
     if args.fp16:
 
         if args.loss_scale == 0:
@@ -367,107 +382,6 @@ def prepare_model_and_optimizer(args, device):
         model = torch.nn.DataParallel(model)
 
     return model, optimizer, lr_scheduler, checkpoint, global_step
-
-def take_optimizer_step(args, optimizer, model, overflow_buf, adasum_scalar, global_step):
-    
-    if args.allreduce_post_accumulation:
-        # manually allreduce gradients after all accumulation steps
-        # check for Inf/NaN
-        # 1. allocate an uninitialized buffer for flattened gradient
-        scaler = _amp_state.loss_scalers[0]
-            
-        # 2. update loss scale
-        #hvd.allreduce_(scaler._overflow_buf, op=hvd.Sum)
-        had_overflow = scaler._overflow_buf.item() > 0
-        scaler._has_overflow = had_overflow
-        scaler.update_scale()
-
-        params = [p for p in amp.master_params(optimizer) if p.grad is not None]
-        starts = [p.clone().detach() for p in params]
-        
-        if had_overflow == False:
-            optimizer.step()
-        else:
-            print(("Rank {} :: Gradient overflow.  Skipping step, "  +
-                   "reducing loss scale to {}").format(
-                       hvd.rank(),
-                       scaler.loss_scale()), flush=True)
-
-        handles = []
-        for index, (start, current) in enumerate(zip(starts, params)):
-            current.data.sub_(start)
-            norm_sq = current.data.norm(p=2,dtype=torch.float32)**2
-            current.data.mul_(adasum_scalar.loss_scale)
-            delta = current#.data.to(torch.float16)
-            #if had_overflow:
-            #    assert delta.norm(p=0) == 0
-            adasum_handle = hvd.allreduce_async(delta, name='all%i'%index, op=hvd.Adasum)
-            normsq_handle = hvd.allreduce_async(norm_sq,name='nsq%i'%index, op=hvd.Sum)
-            handles.append((adasum_handle, normsq_handle, start, current))
-
-        deltas = []
-        for index, (adasum_handle, normsq_handle, start, current) in enumerate(handles):
-            delta = hvd.synchronize(adasum_handle)#.to(torch.float32)
-            deltas.append(delta)
-
-        overflow_buf.zero_()
-        amp_C.multi_tensor_scale(65536,
-                                 overflow_buf,
-                                 [deltas, deltas],
-                                 1.0 / adasum_scalar.loss_scale)
-            
-        adasum_had_overflow = overflow_buf.item() == 1
-        adasum_scalar.update_scale(adasum_had_overflow)
-
-        if adasum_had_overflow:# and is_main_process():
-            print("Adasum had overflow: new scale {}".format(adasum_scalar.loss_scale), flush=True)
-        
-        for index, (adasum_handle, normsq_handle, start, current) in enumerate(handles):
-            delta = deltas[index]
-            #if not adasum_had_overflow:
-            #    assert torch.isfinite(delta.data).all().item()
-            a = hvd.synchronize(normsq_handle).item()
-
-            if False:#not adasum_had_overflow:
-                tmp = delta.clone().detach()
-                hvd.broadcast_(tmp, 0)
-                norm = (tmp - delta).norm().item()
-                assert norm == 0, "norm {}".format(norm)
-                    
-            if is_main_process():
-                a = 1 if a == 0 else math.sqrt(a)
-                print("shadow", index, delta.norm(p=2).item() / a, a, flush=True)
-
-            if not adasum_had_overflow:
-                start.add_(delta)
-            current.data.copy_(start)
-
-        if _amp_state.opt_properties.master_weights:
-            for param in optimizer._amp_stash.all_fp32_from_fp16_params:
-                param.grad = None
-                    
-        scaler.clear_overflow_state()
-        global_step += 1
-        optimizer.zero_grad()
-        #for param in model.parameters():
-        #    param.grad = None
-
-        if False:
-            for index, param in enumerate(amp.master_params(optimizer)):
-                tmp = param.clone().detach()
-                hvd.broadcast_(tmp, 0)
-                norm = (param.data - tmp).norm(p=2)
-                #print("XXXX", index, norm)
-                assert norm.item() == 0, "hvd mismatch {}".format(norm.item())
-
-    else:
-        optimizer.step()
-        optimizer.zero_grad()
-        for param in model.parameters():
-            param.grad = None
-        global_step += 1
-
-    return global_step
 
 def take_adasum_step(args, optimizer, model, overflow_buf, adasum_scalar, starts, params):
     handles = []
@@ -509,7 +423,7 @@ def take_adasum_step(args, optimizer, model, overflow_buf, adasum_scalar, starts
             norm = (tmp - delta).norm().item()
             assert norm == 0, "norm {}".format(norm)
 
-        if is_main_process() or index in [397, 395]:
+        if is_main_process():
             a = 1 if a == 0 else math.sqrt(a)
             print("shadow", index, delta.norm(p=2).item() / a, a, flush=True)
 
@@ -550,7 +464,7 @@ def main():
         batch_start = time.time()
         
         pool = ProcessPoolExecutor(1)
-        adasum_scalar = DynamicLossScaler()#init_scale=2**18)
+        adasum_scalar = DynamicLossScaler(init_scale=2**18)
         
         # Note: We loop infinitely over epochs, termination is handled via iteration count
         while True:
@@ -637,6 +551,8 @@ def main():
                         starts = [p.clone().detach() for p in params]
                         
                         lr_scheduler.step()  # learning rate warmup
+                        if not args.do_lamb:
+                            torch.nn.utils.clip_grad_norm_(params, 1.0)
                         optimizer.step() #global_step = take_optimizer_step(args, optimizer, model, overflow_buf, adasum_scalar, global_step)
                         take_adasum_step(args, optimizer, model, overflow_buf, adasum_scalar, starts, params)
                         optimizer.zero_grad()
